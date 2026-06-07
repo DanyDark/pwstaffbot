@@ -202,7 +202,8 @@ def save_responses(user_id, poll_id, responses_dict):
     conn.commit()
     conn.close()
 
-def get_responses_for_export(poll_id):
+def get_responses_grouped_by_meeting(poll_id):
+    """Возвращает словарь: {название_встречи: [(ник, класс, ответ), ...]}"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -210,13 +211,17 @@ def get_responses_for_export(poll_id):
         FROM poll_responses pr
         JOIN users u ON pr.user_id = u.user_id
         WHERE pr.poll_id = ?
-        ORDER BY pr.meeting, u.nick
     ''', (poll_id,))
     rows = cursor.fetchall()
     conn.close()
-    return rows
+    grouped = {}
+    for nick, user_class, meeting, answer in rows:
+        if meeting not in grouped:
+            grouped[meeting] = []
+        grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
+    return grouped
 
-# ---------- GOOGLE SHEETS (каждый опрос – новый лист) ----------
+# ---------- GOOGLE SHEETS ----------
 def get_google_sheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -231,6 +236,18 @@ def get_google_sheet():
     except Exception as e:
         logging.error(f"Ошибка подключения: {e}")
         return None
+
+def sanitize_sheet_name(name):
+    """Очищает название листа для Google Sheets (макс 100 символов, убирает запрещённые символы)"""
+    forbidden = r'[]:*?/\\'
+    for ch in forbidden:
+        name = name.replace(ch, '')
+    if len(name) > 100:
+        name = name[:100]
+    name = name.strip()
+    if not name:
+        name = "Лист"
+    return name
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -252,24 +269,28 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
         return
 
-    try:
-        rows = get_responses_for_export(poll['id'])
-        headers = ["Название босса", "Ник", "Класс", "Ответ пользователя"]
-        data = [headers]
-        for nick, user_class, meeting, answer in rows:
-            data.append([meeting, nick, user_class if user_class else "Не указан", answer])
-        if len(data) == 1:
-            data.append(["Нет ответов", "", "", ""])
+    grouped = get_responses_grouped_by_meeting(poll['id'])
+    if not grouped:
+        await update.message.reply_text("Нет ответов на опрос. Экспорт не выполнен.")
+        return
 
-        # Создаём новый лист с именем "Опрос_ID_дата"
-        sheet_name = f"Опрос_{poll['id']}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
-        # Проверяем, нет ли листа с таким именем (на всякий случай)
-        existing_sheets = [ws.title for ws in spreadsheet.worksheets()]
-        if sheet_name in existing_sheets:
-            sheet_name = sheet_name + "_new"
-        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="100", cols="20")
-        worksheet.update(values=data, range_name='A1')
-        await update.message.reply_text(f"✅ Результаты опроса выгружены на новый лист **{sheet_name}** в Google Таблице!")
+    headers = ["Ник", "Класс", "Ответ пользователя"]
+
+    try:
+        created_sheets = []
+        for meeting, responses in grouped.items():
+            sheet_name = sanitize_sheet_name(meeting)
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+                worksheet.clear()
+            except gspread.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
+            data = [headers]
+            for nick, user_class, answer in responses:
+                data.append([nick, user_class, answer])
+            worksheet.update(values=data, range_name='A1')
+            created_sheets.append(sheet_name)
+        await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(created_sheets)}")
     except Exception as e:
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets. Проверьте логи.")
@@ -303,7 +324,6 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data['edit_class_nick'] = target_nick
         context.user_data['edit_class_user_id'] = target_user_id
-        # Предлагаем выбрать новый класс
         classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
         await update.message.reply_text(
@@ -321,7 +341,6 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = context.user_data['edit_class_user_id']
     update_user_class(target_user_id, new_class)
     await update.message.reply_text(f"Класс пользователя {context.user_data['edit_class_nick']} изменён на {new_class}.")
-    # Очищаем состояние
     context.user_data.pop('edit_class_mode', None)
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
@@ -355,7 +374,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_class = get_user_class(user_id)
         await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
     else:
-        # Предупреждение перед регистрацией
         await update.message.reply_text(
             "⚠️ *Внимание!*\n"
             "Бот будет использовать ваш игровой ник (из списка) и ваш Telegram ID для идентификации.\n"
@@ -568,6 +586,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     poll_id = int(parts[1])
     answer_str = None
+    answer_idx = -1
     for i, p in enumerate(parts):
         if p in ('да', 'нет', 'не знаю'):
             answer_str = p
