@@ -156,7 +156,7 @@ def get_responses_for_poll(poll_id):
     return rows
 
 def get_response_summary(poll_id, meetings):
-    """Возвращает словарь {meeting: {nick: answer}} для удобного форматирования"""
+    """Возвращает словарь {meeting: {nick: answer}}"""
     rows = get_responses_for_poll(poll_id)
     summary = {m: {} for m in meetings}
     for nick, meeting, answer in rows:
@@ -181,7 +181,6 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_poll_keyboard(meetings, poll_id):
-    """Формирует inline-клавиатуру для опроса: для каждой встречи три кнопки Да/Нет/Не знаю"""
     keyboard = []
     for meeting in meetings:
         row = [
@@ -220,7 +219,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ник не найден в белом списке. Попробуйте ещё раз.")
         return
 
-    # Если не зарегистрирован
     if not is_registered(user_id):
         await update.message.reply_text("Пожалуйста, начните с /start для регистрации.")
         return
@@ -230,10 +228,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nick = get_user_nick(user_id)
         await update.message.reply_text(f"Ваш ник: {nick}\nВаш Telegram ID: `{user_id}`", parse_mode="Markdown")
     elif text == "❓ Помощь":
-        await update.message.reply_text(
-            "Доступные команды:\n/start — меню\n/menu — показать меню\n\n"
-            "Используйте кнопки для навигации."
-        )
+        await update.message.reply_text("Используйте кнопки меню. /start — показать меню.")
     elif text == "📊 Админ-панель" and is_admin(user_id):
         await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
     elif text == "🔙 Назад" and is_admin(user_id):
@@ -242,18 +237,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Админ-команды через кнопки
     elif text == "📝 Создать опрос" and is_admin(user_id):
         context.user_data['poll_creation'] = {'step': 'text'}
-        await update.message.reply_text("Введите текст объявления для опроса (можно многострочный).\nДля отмены введите /cancel")
+        await update.message.reply_text("Введите текст объявления для опроса.\nДля отмены введите /cancel")
     elif text == "📤 Разослать опрос" and is_admin(user_id):
         await send_poll_now(update, context)
     elif text == "📈 Результаты опроса" and is_admin(user_id):
         await show_results(update, context)
     elif text == "🚫 Завершить опрос" and is_admin(user_id):
         deactivate_poll()
-        await update.message.reply_text("Текущий опрос завершён. Новые опросы можно создавать через /new_poll.")
+        await update.message.reply_text("Текущий опрос завершён.")
     elif text == "👥 Список пользователей" and is_admin(user_id):
         users = get_all_users()
         if not users:
-            await update.message.reply_text("Нет зарегистрированных пользователей.")
+            await update.message.reply_text("Нет пользователей.")
             return
         msg = "📋 *Список пользователей:*\n"
         for uid, nick, reg_date in users:
@@ -265,9 +260,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="Markdown")
     elif text == "🔢 Количество" and is_admin(user_id):
         count = len(get_all_users())
-        await update.message.reply_text(f"👥 Зарегистрировано пользователей: {count}")
+        await update.message.reply_text(f"👥 Зарегистрировано: {count}")
     else:
-        await update.message.reply_text("Неизвестная команда. Используйте кнопки меню или /start.")
+        await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
 # ---------- СОЗДАНИЕ ОПРОСА (пошаговый диалог) ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -283,12 +278,11 @@ async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         data['step'] = 'meeting'
         await update.message.reply_text("Теперь вводите встречи по одной строке. Когда закончите, отправьте /done")
     elif data['step'] == 'meeting':
-        if text.lower() == '/done':
+        if text == '/done':
             if not data['meetings']:
                 await update.message.reply_text("Вы не добавили ни одной встречи. Опрос отменён.")
                 del context.user_data['poll_creation']
                 return
-            # Сохраняем опрос
             create_poll(data['text'], data['meetings'])
             await update.message.reply_text(f"Опрос создан!\nТекст: {data['text']}\nВстречи: {', '.join(data['meetings'])}")
             del context.user_data['poll_creation']
@@ -303,25 +297,21 @@ async def cancel_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         await update.message.reply_text("Нет активного процесса создания опроса.")
 
-# ---------- РАССЫЛКА ОПРОСА (админ) ----------
+# ---------- РАССЫЛКА ОПРОСА ----------
 async def send_poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-
     poll = get_active_poll()
     if not poll:
-        await update.message.reply_text("Нет активного опроса. Сначала создайте опрос через /new_poll.")
+        await update.message.reply_text("Нет активного опроса. Сначала создайте опрос через кнопку '📝 Создать опрос'.")
         return
-
     users = get_all_users()
     if not users:
-        await update.message.reply_text("Нет зарегистрированных пользователей для рассылки.")
+        await update.message.reply_text("Нет зарегистрированных пользователей.")
         return
-
-    await update.message.reply_text(f"Начинаю рассылку опроса {len(users)} пользователям...")
-
+    await update.message.reply_text(f"Начинаю рассылку {len(users)} пользователям...")
     success = 0
     for uid, nick, _ in users:
         try:
@@ -333,43 +323,37 @@ async def send_poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             success += 1
         except Exception as e:
-            logging.error(f"Не удалось отправить пользователю {uid}: {e}")
+            logging.error(f"Не удалось отправить {uid}: {e}")
+    await update.message.reply_text(f"Рассылка завершена. Отправлено {success} из {len(users)}.")
 
-    await update.message.reply_text(f"Рассылка завершена. Отправлено {success} из {len(users)} пользователей.")
-
-# ---------- ОБРАБОТКА ОТВЕТОВ НА ОПРОС (inline кнопки) ----------
+# ---------- ОБРАБОТКА ОТВЕТОВ ----------
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    # Формат: poll_{poll_id}_{meeting}_{answer}
-    parts = data.split('_', 3)  # ['poll', '123', 'Комендант', 'да']
+    parts = data.split('_', 3)
     if len(parts) != 4 or parts[0] != 'poll':
         await query.edit_message_text("Ошибка: некорректные данные.")
         return
     _, poll_id_str, meeting, answer = parts
     poll_id = int(poll_id_str)
     user_id = query.from_user.id
-
     if not is_registered(user_id):
-        await query.edit_message_text("Вы не зарегистрированы. Пожалуйста, начните с /start")
+        await query.edit_message_text("Вы не зарегистрированы. Напишите /start")
         return
-
     save_response(user_id, poll_id, meeting, answer)
-    await query.edit_message_text(f"Ваш ответ на встречу '{meeting}': {answer} сохранён. Спасибо!")
+    await query.edit_message_text(f"Ваш ответ на '{meeting}': {answer} сохранён. Спасибо!")
 
-# ---------- ПОКАЗ РЕЗУЛЬТАТОВ (админ) ----------
+# ---------- РЕЗУЛЬТАТЫ ----------
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-
     poll = get_active_poll()
     if not poll:
         await update.message.reply_text("Нет активного опроса.")
         return
-
     summary = get_response_summary(poll['id'], poll['meetings'])
     result_text = f"📊 *Результаты опроса (ID {poll['id']})*\n\n{poll['text']}\n\n"
     for meeting in poll['meetings']:
@@ -387,7 +371,7 @@ async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result_text:
         await update.message.reply_text(result_text, parse_mode="Markdown")
 
-# ---------- ОБЫЧНЫЕ АДМИН-КОМАНДЫ (для обратной совместимости) ----------
+# ---------- ОБЫЧНЫЕ АДМИН-КОМАНДЫ ----------
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -431,25 +415,16 @@ def main():
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("count", count_command))
-    app.add_handler(CommandHandler("new_poll", new_poll_command))
     app.add_handler(CommandHandler("send_poll", send_poll_now))
     app.add_handler(CommandHandler("results", show_results))
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_poll_creation))
 
-    # Обработчики сообщений и callback'ов
+    # Обработчики текста и callback'ов
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^📝 Создать опрос$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^📤 Разослать опрос$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^📈 Результаты опроса$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^🚫 Завершить опрос$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^👥 Список пользователей$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^🔢 Количество$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^📊 Админ-панель$'), handle_text))
-    app.add_handler(MessageHandler(filters.Regex(r'^🔙 Назад$'), handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback))
 
-    # Отдельно для создания опроса (чтобы перехватывать /done)
+    # Специальный обработчик для создания опроса (перехватывает сообщения при активном poll_creation)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
 
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
