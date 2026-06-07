@@ -69,14 +69,15 @@ def init_db():
         )
     ''')
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS cash_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS cash_orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             nick TEXT,
-            screenshot_file_id TEXT,
+            photo_file_id TEXT,
             description TEXT,
             status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at TIMESTAMP
         )
     ''')
     conn.commit()
@@ -151,7 +152,7 @@ def delete_user(user_id):
     cursor = conn.cursor()
     cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     cursor.execute("DELETE FROM poll_responses WHERE user_id = ?", (user_id,))
-    cursor.execute("DELETE FROM cash_requests WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM cash_orders WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -183,6 +184,36 @@ def is_user_valid(user_id):
         delete_user(user_id)
         return False
     return True
+
+# ---------- КЕШ-ЗАЯВКИ ----------
+def create_cash_order(user_id, nick, photo_file_id, description):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status)
+        VALUES (?, ?, ?, ?, 'pending')
+    ''', (user_id, nick, photo_file_id, description))
+    conn.commit()
+    conn.close()
+
+def get_pending_orders():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, user_id, nick, photo_file_id, description FROM cash_orders WHERE status = 'pending' ORDER BY created_at")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def update_order_status(order_id, status):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE cash_orders SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE order_id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+def get_next_pending_order():
+    orders = get_pending_orders()
+    return orders[0] if orders else None
 
 # ---------- ОПРОСЫ ----------
 def create_poll(text, meetings):
@@ -312,60 +343,6 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets. Проверьте логи.")
 
-# ---------- ЗАКАЗ КЕША ----------
-def save_cash_request(user_id, nick, screenshot_file_id, description):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO cash_requests (user_id, nick, screenshot_file_id, description)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, nick, screenshot_file_id, description))
-    conn.commit()
-    conn.close()
-
-def get_pending_cash_requests():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, user_id, nick, screenshot_file_id, description
-        FROM cash_requests
-        WHERE status = 'pending'
-        ORDER BY created_at
-    ''')
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def update_cash_request_status(request_id, status):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE cash_requests SET status = ? WHERE id = ?", (status, request_id))
-    conn.commit()
-    conn.close()
-
-def get_next_pending_request(current_id=None):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    if current_id:
-        cursor.execute('''
-            SELECT id, user_id, nick, screenshot_file_id, description
-            FROM cash_requests
-            WHERE status = 'pending' AND id > ?
-            ORDER BY id
-            LIMIT 1
-        ''', (current_id,))
-    else:
-        cursor.execute('''
-            SELECT id, user_id, nick, screenshot_file_id, description
-            FROM cash_requests
-            WHERE status = 'pending'
-            ORDER BY id
-            LIMIT 1
-        ''')
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
 # ---------- РЕДАКТИРОВАНИЕ/УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ----------
 async def edit_class_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -382,11 +359,11 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         return
     text = update.message.text.strip()
-    if text.lower() == '/cancel':
+    if text.lower() == '/cancel' or text == "❌ Отмена":
         context.user_data.pop('edit_class_mode', None)
         context.user_data.pop('edit_class_nick', None)
         context.user_data.pop('edit_class_user_id', None)
-        await update.message.reply_text("Редактирование отменено.")
+        await update.message.reply_text("Редактирование отменено.", reply_markup=get_main_keyboard(user_id))
         return
     if 'edit_class_nick' not in context.user_data:
         target_nick = text
@@ -398,6 +375,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['edit_class_user_id'] = target_user_id
         classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
+        keyboard.append([KeyboardButton("❌ Отмена")])
         await update.message.reply_text(
             f"Найден пользователь: {target_nick}. Текущий класс: {get_user_class(target_user_id)}.\n"
             "Выберите новый класс:",
@@ -453,7 +431,7 @@ async def confirm_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{target_user_id}")],
             [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_del")]
         ])
-        await update.message.reply_text(f"Вы действительно хотите удалить пользователя {nick_to_delete}? Все его ответы на опросы будут потеряны.", reply_markup=keyboard)
+        await update.message.reply_text(f"Вы действительно хотите удалить пользователя {nick_to_delete}? Все его ответы на опросы и заявки будут потеряны.", reply_markup=keyboard)
 
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -479,79 +457,126 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('confirm_delete', None)
         await delete_user_command(update, context)
 
-# ---------- ВЫДАЧА КЕША (АДМИН) ----------
-async def show_next_cash_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- КЕШ-ЗАЯВКИ (обработчики) ----------
+async def cash_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_valid(user_id):
+        await update.message.reply_text("Вы не зарегистрированы или ваш ник удалён. Нажмите /start.")
+        return
+    context.user_data['cash_order'] = {'step': 'photo'}
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    await update.message.reply_text("Пожалуйста, отправьте фото из личного кабинета с донатом.", reply_markup=keyboard)
+
+async def cancel_cash_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if 'cash_order' in context.user_data:
+        del context.user_data['cash_order']
+    await update.message.reply_text("Заказ кеша отменён.", reply_markup=get_main_keyboard(user_id))
+
+async def handle_cash_order_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.user_data.get('cash_order') or context.user_data['cash_order'].get('step') != 'photo':
+        return
+    if not update.message.photo:
+        await update.message.reply_text("Пожалуйста, отправьте фото (скриншот).")
+        return
+    photo_file = await update.message.photo[-1].get_file()
+    photo_file_id = photo_file.file_id
+    context.user_data['cash_order']['photo_file_id'] = photo_file_id
+    context.user_data['cash_order']['step'] = 'description'
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    await update.message.reply_text("Что хотите получить? (опишите)", reply_markup=keyboard)
+
+async def handle_cash_order_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not context.user_data.get('cash_order') or context.user_data['cash_order'].get('step') != 'description':
+        return
+    description = update.message.text
+    nick = get_user_nick(user_id)
+    photo_file_id = context.user_data['cash_order']['photo_file_id']
+    create_cash_order(user_id, nick, photo_file_id, description)
+    del context.user_data['cash_order']
+    await update.message.reply_text("✅ Заявка отправлена. Ожидайте получения.", reply_markup=get_main_keyboard(user_id))
+    # Уведомить админов
+    for admin_id in ADMIN_LIST:
+        try:
+            await context.bot.send_message(admin_id, f"📦 Новая заявка на кеш от {nick} (ID: {user_id})\nОписание: {description}")
+        except Exception as e:
+            logging.error(f"Не удалось уведомить админа {admin_id}: {e}")
+
+async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админская команда: выдача кеша (показать следующую заявку)"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    current_id = context.user_data.get('current_cash_request_id')
-    request = get_next_pending_request(current_id)
-    if not request:
+    order = get_next_pending_order()
+    if not order:
         await update.message.reply_text("Нет новых заявок на кеш.")
-        context.user_data.pop('current_cash_request_id', None)
         return
-    req_id, req_user_id, req_nick, screenshot_file_id, description = request
-    context.user_data['current_cash_request_id'] = req_id
-    caption = f"📝 *Заявка на кеш*\nНик: {req_nick}\nЧто хочет: {description}"
+    order_id, uid, nick, photo_file_id, description = order
+    # Сохраняем текущую заявку в context.user_data для админа
+    context.user_data['current_cash_order'] = {'order_id': order_id, 'user_id': uid, 'nick': nick}
+    # Отправляем фото и текст
+    try:
+        await context.bot.send_photo(chat_id=user_id, photo=photo_file_id, caption=f"👤 Ник: {nick}\n📝 Что хочет: {description}")
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось отправить фото. Ошибка: {e}\nТекст заявки: {nick} - {description}")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Отправлено", callback_data=f"cash_complete_{req_id}")],
-        [InlineKeyboardButton("❌ Отклонено", callback_data=f"cash_reject_{req_id}")]
+        [InlineKeyboardButton("✅ Отправлено", callback_data=f"cash_done_{order_id}")],
+        [InlineKeyboardButton("❌ Отклонено", callback_data=f"cash_reject_{order_id}")]
     ])
-    if screenshot_file_id:
-        await update.message.reply_photo(photo=screenshot_file_id, caption=caption, parse_mode="Markdown", reply_markup=keyboard)
-    else:
-        await update.message.reply_text(caption, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text("Действие по заявке:", reply_markup=keyboard)
 
 async def cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
     user_id = query.from_user.id
     if not is_admin(user_id):
         await query.edit_message_text("Доступно только администратору.")
         return
-    data = query.data
-    if data.startswith("cash_complete_"):
-        request_id = int(data.split('_')[2])
-        update_cash_request_status(request_id, 'completed')
+    if data.startswith("cash_done_"):
+        order_id = int(data.split('_')[2])
+        update_order_status(order_id, 'done')
+        await query.edit_message_text("✅ Заявка отмечена как выполненная.")
+        # Уведомить пользователя
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, nick FROM cash_requests WHERE id = ?", (request_id,))
+        cursor.execute("SELECT user_id FROM cash_orders WHERE order_id = ?", (order_id,))
         row = cursor.fetchone()
         conn.close()
         if row:
-            target_user_id, nick = row
+            uid = row[0]
             try:
-                await context.bot.send_message(target_user_id, f"✅ Ваша заявка на кеш (ник: {nick}) выполнена! Проверьте получение.")
-            except:
-                pass
-        await query.edit_message_text("✅ Заявка отмечена как выполненная. Переход к следующей...")
-        context.user_data.pop('current_cash_request_id', None)
-        await show_next_cash_request(update, context)
+                await context.bot.send_message(uid, "✅ Ваша заявка на кеш выполнена! Приятной игры!")
+            except Exception as e:
+                logging.error(f"Не удалось уведомить пользователя {uid}: {e}")
     elif data.startswith("cash_reject_"):
-        request_id = int(data.split('_')[2])
-        update_cash_request_status(request_id, 'rejected')
+        order_id = int(data.split('_')[2])
+        update_order_status(order_id, 'rejected')
+        await query.edit_message_text("❌ Заявка отклонена.")
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, nick FROM cash_requests WHERE id = ?", (request_id,))
+        cursor.execute("SELECT user_id FROM cash_orders WHERE order_id = ?", (order_id,))
         row = cursor.fetchone()
         conn.close()
         if row:
-            target_user_id, nick = row
+            uid = row[0]
             try:
-                await context.bot.send_message(target_user_id, f"❌ Ваша заявка на кеш (ник: {nick}) отклонена. Попробуйте позже.")
-            except:
-                pass
-        await query.edit_message_text("❌ Заявка отклонена. Переход к следующей...")
-        context.user_data.pop('current_cash_request_id', None)
-        await show_next_cash_request(update, context)
+                await context.bot.send_message(uid, "❌ Ваша заявка на кеш отклонена. Свяжитесь с администратором.")
+            except Exception as e:
+                logging.error(f"Не удалось уведомить пользователя {uid}: {e}")
+    # После обработки переходим к следующей заявке
+    await process_cash_orders(update, context)
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [[KeyboardButton("👤 Мой профиль"), KeyboardButton("❓ Помощь")]]
-    keyboard.append([KeyboardButton("💰 Заказ кеша")])
     if is_admin(user_id):
         keyboard.append([KeyboardButton("📊 Админ-панель")])
+    # Кнопка заказа кеша для всех зарегистрированных
+    keyboard.append([KeyboardButton("💰 Заказ кеша")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_admin_keyboard():
@@ -567,7 +592,7 @@ def get_clan_management_keyboard():
     keyboard = [
         [KeyboardButton("👥 Список пользователей")],
         [KeyboardButton("🗑 Удалить пользователя"), KeyboardButton("✏️ Исправить класс")],
-        [KeyboardButton("💸 Выдача кеша"), KeyboardButton("🔙 Назад")]
+        [KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -597,7 +622,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Редактирование класса
+    # Отмена заказа кеша
+    if text == "❌ Отмена" and (context.user_data.get('cash_order') or context.user_data.get('edit_class_mode') or context.user_data.get('poll_creation')):
+        if context.user_data.get('cash_order'):
+            del context.user_data['cash_order']
+            await update.message.reply_text("Заказ кеша отменён.", reply_markup=get_main_keyboard(user_id))
+            return
+        elif context.user_data.get('edit_class_mode'):
+            context.user_data.pop('edit_class_mode', None)
+            context.user_data.pop('edit_class_nick', None)
+            context.user_data.pop('edit_class_user_id', None)
+            await update.message.reply_text("Редактирование класса отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        elif context.user_data.get('poll_creation'):
+            del context.user_data['poll_creation']
+            await update.message.reply_text("Создание опроса отменено.", reply_markup=get_admin_keyboard())
+            return
+
+    # Редактирование класса (админ)
     if context.user_data.get('edit_class_mode'):
         await handle_edit_class(update, context)
         return
@@ -607,35 +649,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await confirm_delete_user(update, context)
         return
 
-    # Заказ кеша (пошаговый диалог)
-    if 'cash_order_step' in context.user_data:
-        step = context.user_data['cash_order_step']
-        if step == 'waiting_screenshot':
-            if not update.message.photo:
-                await update.message.reply_text("Пожалуйста, отправьте фото (скриншот).")
-                return
-            photo = update.message.photo[-1]
-            context.user_data['cash_screenshot'] = photo.file_id
-            context.user_data['cash_order_step'] = 'waiting_description'
-            await update.message.reply_text("✏️ Теперь напишите, что вы хотите получить (название предмета, количество и т.п.)")
-            return
-        elif step == 'waiting_description':
-            description = update.message.text.strip()
-            if not description:
-                await update.message.reply_text("Пожалуйста, напишите текст.")
-                return
-            nick = get_user_nick(user_id)
-            screenshot_file_id = context.user_data.get('cash_screenshot')
-            save_cash_request(user_id, nick, screenshot_file_id, description)
-            context.user_data.pop('cash_order_step', None)
-            context.user_data.pop('cash_screenshot', None)
-            await update.message.reply_text("✅ Заявка на кеш отправлена! Ожидайте получения.")
-            for admin_id in ADMIN_LIST:
-                try:
-                    await context.bot.send_message(admin_id, f"📢 Новая заявка на кеш от {nick}!")
-                except:
-                    pass
-            return
+    # Заказ кеша: обработка описания
+    if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'description':
+        await handle_cash_order_description(update, context)
+        return
 
     # Регистрация: шаг 1 – ник
     if context.user_data.get('awaiting_nick'):
@@ -671,7 +688,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
 
-    # Проверка валидности
+    # Проверка валидности пользователя
     if not is_user_valid(user_id):
         await update.message.reply_text(
             "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
@@ -679,7 +696,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- ОСНОВНОЕ МЕНЮ ---
+    # Основное меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -687,22 +704,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "❓ Помощь":
         await update.message.reply_text("Используйте кнопки меню. /start — показать меню.")
     elif text == "💰 Заказ кеша":
-        context.user_data['cash_order_step'] = 'waiting_screenshot'
-        await update.message.reply_text("📸 Пожалуйста, пришлите скриншот из личного кабинета с подтверждением доната.")
+        await cash_order_start(update, context)
     elif text == "📊 Админ-панель" and is_admin(user_id):
         await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
     elif text == "🔙 Назад" and is_admin(user_id):
         await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
-    elif text == "🏰 Управление кланом" and is_admin(user_id):
-        await update.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
-    elif text == "💸 Выдача кеша" and is_admin(user_id):
-        await show_next_cash_request(update, context)
     elif text == "📝 Создать опрос" and is_admin(user_id):
         context.user_data['poll_creation'] = {'step': 'text'}
         await update.message.reply_text(
             "Введите текст объявления для опроса.\n"
             "После этого вводите встречи по одной строке.\n"
-            "В конце нажмите кнопку «✅ Завершить создание»."
+            "В конце нажмите кнопку «✅ Завершить создание».\n"
+            "Для отмены нажмите ❌ Отмена"
         )
     elif text == "📤 Разослать опрос" and is_admin(user_id):
         await send_poll_to_all(update, context)
@@ -717,6 +730,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🚫 Завершить опрос" and is_admin(user_id):
         deactivate_poll()
         await update.message.reply_text("Текущий опрос завершён.")
+    elif text == "🏰 Управление кланом" and is_admin(user_id):
+        await update.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
+    elif text == "💸 Выдача кеша" and is_admin(user_id):
+        await process_cash_orders(update, context)
     elif text == "👥 Список пользователей" and is_admin(user_id):
         users = get_all_users()
         if not users:
@@ -737,6 +754,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
+# ---------- ОБРАБОТЧИК ФОТО ДЛЯ ЗАКАЗА КЕША ----------
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'photo':
+        await handle_cash_order_photo(update, context)
+        return
+    # Если фото отправлено вне заказа – игнорируем
+    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша».")
+
 # ---------- СОЗДАНИЕ ОПРОСА ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -751,7 +777,8 @@ async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         data['step'] = 'meeting'
         await update.message.reply_text(
             "Теперь вводите встречи по одной строке.\n"
-            "После добавления всех встреч нажмите кнопку «✅ Завершить создание»."
+            "После добавления всех встреч нажмите кнопку «✅ Завершить создание».\n"
+            "Для отмены нажмите ❌ Отмена"
         )
     elif data['step'] == 'meeting':
         data['meetings'].append(text.strip())
@@ -1012,13 +1039,14 @@ def main():
     app.add_handler(CommandHandler("sync_whitelist", sync_whitelist_command))
     app.add_handler(CommandHandler("edit_class", edit_class_command))
 
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_"))
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
     app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
     app.add_handler(CallbackQueryHandler(delete_callback, pattern="^(confirm_del_|cancel_del)"))
-    app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_complete_|cash_reject_)"))
+    app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
 
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
