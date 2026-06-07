@@ -2,6 +2,7 @@ import sqlite3
 import logging
 import os
 import json
+import traceback
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -189,33 +190,68 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
+
+    # 1. Проверяем переменные окружения
+    if not GOOGLE_CREDS_JSON:
+        logging.error("GOOGLE_CREDS не задана")
+        await update.message.reply_text("❌ Ошибка: переменная GOOGLE_CREDS не задана на хостинге.")
+        return
+    if not GOOGLE_SHEET_ID:
+        logging.error("GOOGLE_SHEET_ID не задан")
+        await update.message.reply_text("❌ Ошибка: переменная GOOGLE_SHEET_ID не задана на хостинге.")
+        return
+
+    # 2. Получаем активный опрос
     poll = get_active_poll()
     if not poll:
         await update.message.reply_text("Нет активного опроса для экспорта.")
         return
-    sheet = get_google_sheet()
-    if sheet is None:
-        await update.message.reply_text("Не удалось подключиться к Google Sheets. Проверьте переменные GOOGLE_CREDS и GOOGLE_SHEET_ID.")
+
+    # 3. Подключаемся к Google Sheets
+    try:
+        sheet = get_google_sheet()
+        if sheet is None:
+            await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте логи.")
+            return
+    except Exception as e:
+        logging.error(f"Ошибка при получении sheet: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка подключения к Google Sheets. Подробности в логах.")
         return
-    summary = get_response_summary(poll['id'], poll['meetings'])
-    # Формируем данные: заголовки + строки
-    headers = ["Название опроса", "Текст опроса", "Встреча", "Ник", "Ответ"]
-    data = [headers]
-    for meeting in poll['meetings']:
-        responses = summary.get(meeting, {})
-        if responses:
-            for nick, answer in responses.items():
-                data.append([f"Опрос {poll['id']}", poll['text'], meeting, nick, answer])
-        else:
-            data.append([f"Опрос {poll['id']}", poll['text'], meeting, "Нет ответов", "-"])
+
+    # 4. Получаем сводку ответов
+    try:
+        summary = get_response_summary(poll['id'], poll['meetings'])
+    except Exception as e:
+        logging.error(f"Ошибка получения сводки: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка при формировании данных опроса.")
+        return
+
+    # 5. Формируем данные для записи
+    try:
+        headers = ["Название опроса", "Текст опроса", "Встреча", "Ник", "Ответ"]
+        data = [headers]
+        for meeting in poll['meetings']:
+            responses = summary.get(meeting, {})
+            if responses:
+                for nick, answer in responses.items():
+                    data.append([f"Опрос {poll['id']}", poll['text'], meeting, nick, answer])
+            else:
+                data.append([f"Опрос {poll['id']}", poll['text'], meeting, "Нет ответов", "-"])
+    except Exception as e:
+        logging.error(f"Ошибка формирования data: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка подготовки данных.")
+        return
+
+    # 6. Очищаем и записываем в таблицу
     try:
         sheet.clear()
+        logging.info("Лист очищен")
         sheet.update(values=data, range_name='A1')
+        logging.info(f"Записано {len(data)} строк")
         await update.message.reply_text("✅ Результаты опроса успешно выгружены в Google Таблицу!")
     except Exception as e:
-        logging.error(f"Ошибка записи: {e}")
-        await update.message.reply_text("Произошла ошибка при записи в Google Sheets.")
-
+        logging.error(f"Ошибка при записи в Google Sheets: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка при записи в Google Sheets. Проверьте права доступа к таблице и корректность GOOGLE_CREDS.")
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [[KeyboardButton("👤 Мой профиль"), KeyboardButton("❓ Помощь")]]
