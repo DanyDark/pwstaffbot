@@ -329,20 +329,23 @@ def add_activity_column(ws, activity_name):
     return col_num
 
 def mark_activity_for_nicks(ws, activity_name, nicks):
-    """Ставит '+' в столбце activity_name для найденных ников (по первому столбцу)"""
     all_values = ws.get_all_values()
     if not all_values:
         return 0
     headers = all_values[0]
-    if activity_name not in headers:
+    # Нормализуем заголовки: убираем пробелы, приводим к нижнему регистру
+    normalized_headers = [h.strip().lower() for h in headers]
+    target = activity_name.strip().lower()
+    try:
+        col_idx = normalized_headers.index(target) + 1
+    except ValueError:
+        # Если столбец не найден, добавляем его
         col_idx = add_activity_column(ws, activity_name)
-    else:
-        col_idx = headers.index(activity_name) + 1
     updated = 0
     for row_idx, row in enumerate(all_values[1:], start=2):
         nick_in_sheet = row[0].strip()
         if nick_in_sheet.lower() in [n.lower() for n in nicks]:
-            ws.update_cell(row_idx, col_idx, "+")
+            ws.update_cell(row_idx, col_idx, "БЫЛ")
             updated += 1
     return updated
 
