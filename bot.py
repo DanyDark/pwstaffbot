@@ -3,6 +3,7 @@ import logging
 import os
 import json
 import traceback
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
@@ -72,7 +73,6 @@ def init_db():
 
 # ---------- БЕЛЫЙ СПИСОК ----------
 def load_whitelist():
-    """Возвращает set() ников из whitelist.txt (в нижнем регистре)"""
     whitelist = set()
     try:
         with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
@@ -85,9 +85,7 @@ def load_whitelist():
     return whitelist
 
 def is_nick_in_whitelist(nick):
-    """Проверяет, есть ли ник в белом списке (без учёта регистра)"""
-    whitelist = load_whitelist()
-    return nick.lower() in whitelist
+    return nick.lower() in load_whitelist()
 
 # ---------- ПОЛЬЗОВАТЕЛИ ----------
 def is_registered(user_id):
@@ -114,8 +112,22 @@ def get_user_class(user_id):
     conn.close()
     return row[0] if row else None
 
+def get_user_id_by_nick(nick):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE nick = ?", (nick,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def update_user_class(user_id, new_class):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET class = ? WHERE user_id = ?", (new_class, user_id))
+    conn.commit()
+    conn.close()
+
 def delete_user(user_id):
-    """Удаляет пользователя и его ответы на опросы"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
@@ -142,32 +154,15 @@ def is_admin(user_id):
     return user_id in ADMIN_LIST
 
 def is_user_valid(user_id):
-    """Проверяет, зарегистрирован ли пользователь и его ник в белом списке"""
     if not is_registered(user_id):
         return False
     nick = get_user_nick(user_id)
     if not nick:
         return False
     if not is_nick_in_whitelist(nick):
-        # Ник удалён из белого списка – удаляем пользователя из БД
         delete_user(user_id)
         return False
     return True
-
-async def sync_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админская команда: удаляет всех пользователей, чьи ники отсутствуют в whitelist.txt"""
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    whitelist = load_whitelist()
-    users = get_all_users()
-    deleted = 0
-    for uid, nick, _, _ in users:
-        if nick.lower() not in whitelist:
-            delete_user(uid)
-            deleted += 1
-    await update.message.reply_text(f"Синхронизация завершена. Удалено пользователей: {deleted}")
 
 # ---------- ОПРОСЫ ----------
 def create_poll(text, meetings):
@@ -208,7 +203,6 @@ def save_responses(user_id, poll_id, responses_dict):
     conn.close()
 
 def get_responses_for_export(poll_id):
-    """Возвращает список (nick, class, meeting, answer) для выгрузки"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -222,25 +216,7 @@ def get_responses_for_export(poll_id):
     conn.close()
     return rows
 
-def get_response_summary(poll_id, meetings):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT u.nick, pr.meeting, pr.answer
-        FROM poll_responses pr
-        JOIN users u ON pr.user_id = u.user_id
-        WHERE pr.poll_id = ?
-        ORDER BY pr.meeting, u.nick
-    ''', (poll_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    summary = {m: {} for m in meetings}
-    for nick, meeting, answer in rows:
-        if meeting in summary:
-            summary[meeting][nick] = answer
-    return summary
-
-# ---------- GOOGLE SHEETS ----------
+# ---------- GOOGLE SHEETS (каждый опрос – новый лист) ----------
 def get_google_sheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -250,10 +226,10 @@ def get_google_sheet():
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         client = gspread.authorize(creds)
-        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-        return sheet
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        return spreadsheet
     except Exception as e:
-        logging.error(f"Ошибка подключения к Google Sheets: {e}")
+        logging.error(f"Ошибка подключения: {e}")
         return None
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,8 +247,8 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активного опроса для экспорта.")
         return
 
-    sheet = get_google_sheet()
-    if sheet is None:
+    spreadsheet = get_google_sheet()
+    if spreadsheet is None:
         await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
         return
 
@@ -284,12 +260,71 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data.append([meeting, nick, user_class if user_class else "Не указан", answer])
         if len(data) == 1:
             data.append(["Нет ответов", "", "", ""])
-        sheet.clear()
-        sheet.update(values=data, range_name='A1')
-        await update.message.reply_text("✅ Результаты опроса выгружены в Google Таблицу!")
+
+        # Создаём новый лист с именем "Опрос_ID_дата"
+        sheet_name = f"Опрос_{poll['id']}_{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+        # Проверяем, нет ли листа с таким именем (на всякий случай)
+        existing_sheets = [ws.title for ws in spreadsheet.worksheets()]
+        if sheet_name in existing_sheets:
+            sheet_name = sheet_name + "_new"
+        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="100", cols="20")
+        worksheet.update(values=data, range_name='A1')
+        await update.message.reply_text(f"✅ Результаты опроса выгружены на новый лист **{sheet_name}** в Google Таблице!")
     except Exception as e:
-        logging.error(f"Ошибка при записи: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка при записи в Google Sheets. Проверьте права доступа.")
+        logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets. Проверьте логи.")
+
+# ---------- РЕДАКТИРОВАНИЕ КЛАССА ПО НИКУ ----------
+async def edit_class_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    context.user_data['edit_class_mode'] = True
+    await update.message.reply_text("Введите ник пользователя, чей класс нужно изменить:")
+
+async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('edit_class_mode'):
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    text = update.message.text.strip()
+    if text.lower() == '/cancel':
+        context.user_data.pop('edit_class_mode', None)
+        await update.message.reply_text("Редактирование отменено.")
+        return
+    # Первый шаг – получили ник
+    if 'edit_class_nick' not in context.user_data:
+        target_nick = text
+        target_user_id = get_user_id_by_nick(target_nick)
+        if not target_user_id:
+            await update.message.reply_text(f"Пользователь с ником {target_nick} не найден в БД. Попробуйте ещё раз или /cancel.")
+            return
+        context.user_data['edit_class_nick'] = target_nick
+        context.user_data['edit_class_user_id'] = target_user_id
+        # Предлагаем выбрать новый класс
+        classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+        keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
+        await update.message.reply_text(
+            f"Найден пользователь: {target_nick}. Текущий класс: {get_user_class(target_user_id)}.\n"
+            "Выберите новый класс:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        )
+        return
+    # Второй шаг – получили класс
+    new_class = text.upper()
+    valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+    if new_class not in valid_classes:
+        await update.message.reply_text("Неверный класс. Выберите из предложенных кнопок.")
+        return
+    target_user_id = context.user_data['edit_class_user_id']
+    update_user_class(target_user_id, new_class)
+    await update.message.reply_text(f"Класс пользователя {context.user_data['edit_class_nick']} изменён на {new_class}.")
+    # Очищаем состояние
+    context.user_data.pop('edit_class_mode', None)
+    context.user_data.pop('edit_class_nick', None)
+    context.user_data.pop('edit_class_user_id', None)
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
@@ -303,7 +338,7 @@ def get_admin_keyboard():
         [KeyboardButton("📝 Создать опрос"), KeyboardButton("📤 Разослать опрос")],
         [KeyboardButton("📈 Результаты опроса"), KeyboardButton("📋 Текущий опрос")],
         [KeyboardButton("🚫 Завершить опрос"), KeyboardButton("👥 Список пользователей")],
-        [KeyboardButton("🔢 Количество"), KeyboardButton("🔙 Назад")]
+        [KeyboardButton("🔢 Количество"), KeyboardButton("✏️ Изменить класс"), KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -312,7 +347,7 @@ def get_class_keyboard():
     keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ ----------
+# ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_registered(user_id):
@@ -320,21 +355,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_class = get_user_class(user_id)
         await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
     else:
-        context.user_data['awaiting_nick'] = True
+        # Предупреждение перед регистрацией
         await update.message.reply_text(
-            "Привет! Вы не зарегистрированы.\nПожалуйста, введите свой ник из списка."
+            "⚠️ *Внимание!*\n"
+            "Бот будет использовать ваш игровой ник (из списка) и ваш Telegram ID для идентификации.\n"
+            "Никакие другие персональные данные не собираются.\n\n"
+            "Для продолжения регистрации введите свой игровой ник из списка.",
+            parse_mode="Markdown"
         )
+        context.user_data['awaiting_nick'] = True
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Этап 1: ожидание ввода ника
+    # Обработка редактирования класса (админ)
+    if context.user_data.get('edit_class_mode'):
+        await handle_edit_class(update, context)
+        return
+
+    # Регистрация: шаг 1 – ник
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
-        whitelist = load_whitelist()
-        if nick.lower() in whitelist:
-            # Сохраняем ник, ждём выбора класса
+        if is_nick_in_whitelist(nick):
             context.user_data['temp_nick'] = nick
             context.user_data['awaiting_nick'] = False
             context.user_data['awaiting_class'] = True
@@ -346,7 +389,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ник не найден в белом списке. Попробуйте ещё раз.")
         return
 
-    # Этап 2: ожидание выбора класса
+    # Регистрация: шаг 2 – класс
     if context.user_data.get('awaiting_class'):
         valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         if text in valid_classes:
@@ -362,7 +405,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
 
-    # Основное меню (проверяем валидность пользователя)
+    # Основное меню (проверяем валидность)
     if not is_user_valid(user_id):
         await update.message.reply_text(
             "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
@@ -390,7 +433,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📤 Разослать опрос" and is_admin(user_id):
         await send_poll_to_all(update, context)
     elif text == "📈 Результаты опроса" and is_admin(user_id):
-        await show_results(update, context)
+        await export_command(update, context)
     elif text == "📋 Текущий опрос" and is_admin(user_id):
         poll = get_active_poll()
         if poll:
@@ -400,6 +443,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🚫 Завершить опрос" and is_admin(user_id):
         deactivate_poll()
         await update.message.reply_text("Текущий опрос завершён.")
+    elif text == "✏️ Изменить класс" and is_admin(user_id):
+        await edit_class_command(update, context)
     elif text == "👥 Список пользователей" and is_admin(user_id):
         users = get_all_users()
         if not users:
@@ -475,7 +520,6 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Начинаю рассылку опроса {len(users)} пользователям...")
     success = 0
     for uid, nick, _, _ in users:
-        # Проверяем, что пользователь всё ещё валиден (ник в whitelist)
         if not is_user_valid(uid):
             logging.info(f"Пользователь {uid} ({nick}) пропущен: ник не в белом списке")
             continue
@@ -511,7 +555,6 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    # Проверка валидности пользователя перед обработкой ответа
     if not is_user_valid(user_id):
         await query.edit_message_text(
             "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
@@ -524,8 +567,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Ошибка: некорректные данные.")
         return
     poll_id = int(parts[1])
-    # Определяем ответ
-    answer_idx = -2
+    answer_str = None
     for i, p in enumerate(parts):
         if p in ('да', 'нет', 'не знаю'):
             answer_str = p
@@ -548,7 +590,6 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['poll_answers'][meeting] = answer_str
 
     if next_index >= len(meetings):
-        # Сводка
         summary_text = "✅ *Ваши ответы:*\n\n"
         for m in meetings:
             ans = context.user_data['poll_answers'].get(m, "❌ Не отвечен")
@@ -629,33 +670,6 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-# ---------- РЕЗУЛЬТАТЫ (текстовые) ----------
-async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    poll = get_active_poll()
-    if not poll:
-        await update.message.reply_text("Нет активного опроса.")
-        return
-    summary = get_response_summary(poll['id'], poll['meetings'])
-    result_text = f"📊 *Результаты опроса (ID {poll['id']})*\n\n{poll['text']}\n\n"
-    for meeting in poll['meetings']:
-        result_text += f"*{meeting}*:\n"
-        responses = summary[meeting]
-        if not responses:
-            result_text += "  Нет ответов.\n"
-        else:
-            for nick, ans in responses.items():
-                result_text += f"  • {nick} → {ans}\n"
-        result_text += "\n"
-        if len(result_text) > 3800:
-            await update.message.reply_text(result_text, parse_mode="Markdown")
-            result_text = ""
-    if result_text:
-        await update.message.reply_text(result_text, parse_mode="Markdown")
-
 # ---------- ОБЩИЕ КОМАНДЫ ----------
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -704,6 +718,20 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Нет активного процесса создания опроса.")
 
+async def sync_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    whitelist = load_whitelist()
+    users = get_all_users()
+    deleted = 0
+    for uid, nick, _, _ in users:
+        if nick.lower() not in whitelist:
+            delete_user(uid)
+            deleted += 1
+    await update.message.reply_text(f"Синхронизация завершена. Удалено пользователей: {deleted}")
+
 # ---------- ЗАПУСК ----------
 def main():
     init_db()
@@ -714,11 +742,11 @@ def main():
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("count", count_command))
     app.add_handler(CommandHandler("send_poll", send_poll_to_all))
-    app.add_handler(CommandHandler("results", show_results))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("sync_whitelist", sync_whitelist_command))
+    app.add_handler(CommandHandler("edit_class", edit_class_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
