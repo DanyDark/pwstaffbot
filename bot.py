@@ -764,10 +764,8 @@ async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         data['text'] = text
         data['meetings'] = []
         data['step'] = 'meeting'
-        keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
         await update.message.reply_text(
-            "Теперь вводите встречи по одной строке.\nКогда закончите, нажмите кнопку «✅ Завершить создание» под сообщением.\n\nДля отмены нажмите «❌ Отмена».",
-            reply_markup=keyboard
+            "Теперь вводите встречи по одной строке.\nКогда закончите, нажмите кнопку «✅ Завершить создание» под сообщением.\n\nДля отмены отправьте «❌ Отмена»."
         )
     elif data['step'] == 'meeting':
         data['meetings'].append(text.strip())
@@ -790,7 +788,7 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
     create_poll(data['text'], data['meetings'])
     meetings_list = ", ".join([f'"{m}"' for m in data['meetings']])
     await query.edit_message_text(
-        f"✅ Опрос создан!\n\n📢 {data['text']}\n\nВстречи: {meetings_list}"
+        f"✅ Опрос создан!\n\nГВГ: {meetings_list}"
     )
     del context.user_data['poll_creation']
     await query.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
