@@ -5,7 +5,6 @@ import json
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Не задана переменная окружения BOT_TOKEN")
@@ -16,7 +15,6 @@ ADMIN_LIST = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip()]
 WHITELIST_FILE = "whitelist.txt"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_FILE = os.path.join(DATA_DIR, "users.db")
-# =============================================
 
 logging.basicConfig(level=logging.INFO)
 
@@ -175,24 +173,7 @@ def get_admin_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def get_meeting_keyboard(poll_id, meeting, index, total):
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да", callback_data=f"poll_{poll_id}_{meeting}_да"),
-            InlineKeyboardButton("❌ Нет", callback_data=f"poll_{poll_id}_{meeting}_нет"),
-            InlineKeyboardButton("❓ Не знаю", callback_data=f"poll_{poll_id}_{meeting}_не знаю")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_confirm_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("✅ Да, всё верно", callback_data="confirm_yes")],
-        [InlineKeyboardButton("❌ Нет, пройти заново", callback_data="confirm_no")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ----------
+# ---------- ОБРАБОТЧИКИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_registered(user_id):
@@ -208,7 +189,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Регистрация
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
         whitelist = load_whitelist()
@@ -224,7 +204,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, начните с /start для регистрации.")
         return
 
-    # Кнопки главного меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         await update.message.reply_text(f"Ваш ник: {nick}\nВаш Telegram ID: `{user_id}`", parse_mode="Markdown")
@@ -234,8 +213,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
     elif text == "🔙 Назад" and is_admin(user_id):
         await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
-
-    # Админ-команды (через кнопки)
     elif text == "📝 Создать опрос" and is_admin(user_id):
         context.user_data['poll_creation'] = {'step': 'text'}
         await update.message.reply_text(
@@ -275,7 +252,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
-# ---------- СОЗДАНИЕ ОПРОСА (АДМИН) ----------
+# ---------- СОЗДАНИЕ ОПРОСА ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) or 'poll_creation' not in context.user_data:
@@ -293,8 +270,10 @@ async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     elif data['step'] == 'meeting':
         data['meetings'].append(text.strip())
-        await update.message.reply_text(f"➕ Добавлена встреча: {text}. Введите следующую или нажмите кнопку ниже для завершения.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Завершить создание", callback_data="finish_poll_creation")]]))
+        await update.message.reply_text(
+            f"➕ Добавлена встреча: {text}. Введите следующую или нажмите кнопку ниже для завершения.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Завершить создание", callback_data="finish_poll_creation")]])
+        )
 
 async def finish_poll_creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -305,15 +284,13 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
         return
     data = context.user_data['poll_creation']
     if data.get('step') != 'meeting' or not data.get('meetings'):
-        await query.edit_message_text("Вы не добавили ни одной встречи. Опрос не создан. Используйте /cancel для отмены.")
+        await query.edit_message_text("Вы не добавили ни одной встречи. Опрос не создан.")
         return
     create_poll(data['text'], data['meetings'])
-    await query.edit_message_text(
-        f"✅ Опрос создан!\n\nТекст: {data['text']}\nВстречи: {', '.join(data['meetings'])}"
-    )
+    await query.edit_message_text(f"✅ Опрос создан!\n\nТекст: {data['text']}\nВстречи: {', '.join(data['meetings'])}")
     del context.user_data['poll_creation']
 
-# ---------- ПОСЛЕДОВАТЕЛЬНАЯ РАССЫЛКА ОПРОСА ----------
+# ---------- РАССЫЛКА ОПРОСА (без глобального хранилища) ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -321,117 +298,151 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     poll = get_active_poll()
     if not poll:
-        await update.message.reply_text("Нет активного опроса. Сначала создайте опрос через '📝 Создать опрос'.")
+        await update.message.reply_text("Нет активного опроса. Сначала создайте опрос.")
         return
     users = get_all_users()
     if not users:
         await update.message.reply_text("Нет зарегистрированных пользователей.")
         return
 
-    await update.message.reply_text(f"Начинаю последовательную рассылку опроса {len(users)} пользователям...")
+    await update.message.reply_text(f"Начинаю рассылку опроса {len(users)} пользователям...")
     success = 0
     for uid, nick, _ in users:
-        # Сохраняем состояние опроса для пользователя в user_data приложения
-        context.application.user_data[uid] = {
-            'poll_id': poll['id'],
-            'meetings': poll['meetings'],
-            'current_index': 0,
-            'temp_answers': {}
-        }
         try:
-            await send_next_question(uid, context)  # передаём context, внутри будем брать bot
+            # Отправляем первый вопрос с индексом 0
+            await send_first_question(uid, poll, context)
             success += 1
         except Exception as e:
             logging.error(f"Не удалось начать опрос для {uid}: {e}")
-    await update.message.reply_text(f"Рассылка инициирована. Отправлено первое сообщение {success} из {len(users)} пользователям.")
+    await update.message.reply_text(f"Рассылка инициирована. Первый вопрос отправлен {success} из {len(users)} пользователям.")
 
-async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет следующий вопрос пользователю, используя данные из context.application.user_data"""
-    user_data = context.application.user_data.get(user_id)
-    if not user_data:
+async def send_first_question(chat_id: int, poll: dict, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет первый вопрос опроса, передавая индекс следующего вопроса через callback_data"""
+    meetings = poll['meetings']
+    if not meetings:
         return
-    idx = user_data['current_index']
-    meetings = user_data['meetings']
-    if idx >= len(meetings):
-        await show_confirmation(user_id, context)
-        return
-    meeting = meetings[idx]
-    poll_id = user_data['poll_id']
-    keyboard = get_meeting_keyboard(poll_id, meeting, idx+1, len(meetings))
+    first_meeting = meetings[0]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да", callback_data=f"poll_{poll['id']}_{first_meeting}_да_1"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"poll_{poll['id']}_{first_meeting}_нет_1"),
+            InlineKeyboardButton("❓ Не знаю", callback_data=f"poll_{poll['id']}_{first_meeting}_не знаю_1")
+        ]
+    ])
     await context.bot.send_message(
-        chat_id=user_id,
-        text=f"📋 *Вопрос {idx+1} из {len(meetings)}*\n\n{meeting}\n\nВаш ответ:",
+        chat_id=chat_id,
+        text=f"📢 *Опрос*\n\n{poll['text']}\n\nВопрос 1 из {len(meetings)}:\n{first_meeting}",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-
-async def show_confirmation(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    user_data = context.application.user_data.get(user_id)
-    if not user_data:
-        return
-    answers = user_data['temp_answers']
-    meetings = user_data['meetings']
-    text = "✅ *Ваши ответы:*\n\n"
-    for m in meetings:
-        ans = answers.get(m, "❌ Не отвечен")
-        text += f"• {m} → {ans}\n"
-    text += "\nВсё верно?"
-    keyboard = get_confirm_keyboard()
-    await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    parts = data.split('_', 3)
-    if len(parts) != 4 or parts[0] != 'poll':
+    # Формат: poll_{poll_id}_{meeting}_{answer}_{next_index}
+    parts = data.split('_')
+    if len(parts) < 5 or parts[0] != 'poll':
         await query.edit_message_text("Ошибка: некорректные данные.")
         return
-    _, poll_id_str, meeting, answer = parts
-    poll_id = int(poll_id_str)
+    poll_id = int(parts[1])
+    meeting = '_'.join(parts[2:-2])  # на случай, если в названии встречи есть _
+    answer = parts[-2]
+    next_index = int(parts[-1])
+
     user_id = query.from_user.id
     if not is_registered(user_id):
         await query.edit_message_text("Вы не зарегистрированы. Напишите /start")
         return
 
-    user_data = context.application.user_data.get(user_id)
-    if not user_data or user_data['poll_id'] != poll_id:
-        await query.edit_message_text("Этот опрос уже не активен или не найден. Начните заново с /start.")
+    # Получаем активный опрос для проверки
+    poll = get_active_poll()
+    if not poll or poll['id'] != poll_id:
+        await query.edit_message_text("Этот опрос уже не активен.")
         return
 
-    # Сохраняем временный ответ
-    user_data['temp_answers'][meeting] = answer
-    user_data['current_index'] += 1
+    meetings = poll['meetings']
+    # Сохраняем ответ во временное хранилище пользователя
+    if 'poll_answers' not in context.user_data:
+        context.user_data['poll_answers'] = {}
+    context.user_data['poll_answers'][meeting] = answer
 
-    # Удаляем клавиатуру у текущего сообщения
-    await query.edit_message_text(f"✅ Ваш ответ на '{meeting}': {answer}\n\nСпасибо!")
+    # Если это был последний вопрос
+    if next_index >= len(meetings):
+        # Показать сводку
+        summary_text = "✅ *Ваши ответы:*\n\n"
+        for m in meetings:
+            ans = context.user_data['poll_answers'].get(m, "❌ Не отвечен")
+            summary_text += f"• {m} → {ans}\n"
+        summary_text += "\nВсё верно?"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, всё верно", callback_data=f"confirm_{poll_id}")],
+            [InlineKeyboardButton("❌ Нет, пройти заново", callback_data=f"restart_{poll_id}")]
+        ])
+        await query.edit_message_text(summary_text, parse_mode="Markdown", reply_markup=keyboard)
+        return
 
-    # Отправляем следующий вопрос
-    await send_next_question(user_id, context)
+    # Иначе отправляем следующий вопрос
+    next_meeting = meetings[next_index]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да", callback_data=f"poll_{poll_id}_{next_meeting}_да_{next_index+1}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"poll_{poll_id}_{next_meeting}_нет_{next_index+1}"),
+            InlineKeyboardButton("❓ Не знаю", callback_data=f"poll_{poll_id}_{next_meeting}_не знаю_{next_index+1}")
+        ]
+    ])
+    await query.edit_message_text(
+        f"📢 *Опрос*\n\n{poll['text']}\n\nВопрос {next_index+1} из {len(meetings)}:\n{next_meeting}",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data  # confirm_{poll_id}
+    poll_id = int(data.split('_')[1])
     user_id = query.from_user.id
-    user_data = context.application.user_data.get(user_id)
-    if not user_data:
-        await query.edit_message_text("Нет активного опроса.")
+    answers = context.user_data.get('poll_answers', {})
+    if not answers:
+        await query.edit_message_text("Нет данных для сохранения.")
         return
+    save_responses(user_id, poll_id, answers)
+    # Очищаем временные данные
+    context.user_data['poll_answers'] = {}
+    await query.edit_message_text("✅ Спасибо! Ваши ответы сохранены. Опрос завершён.")
 
-    if query.data == "confirm_yes":
-        # Сохраняем ответы в БД
-        save_responses(user_id, user_data['poll_id'], user_data['temp_answers'])
-        await query.edit_message_text("✅ Спасибо! Ваши ответы сохранены. Опрос завершён.")
-        # Очищаем сессию
-        del context.application.user_data[user_id]
-    elif query.data == "confirm_no":
-        # Сбрасываем и начинаем заново
-        user_data['temp_answers'] = {}
-        user_data['current_index'] = 0
-        await query.edit_message_text("🔄 Начинаем опрос заново. Пожалуйста, ответьте на вопросы.")
-        await send_next_question(user_id, context)
+async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # restart_{poll_id}
+    poll_id = int(data.split('_')[1])
+    user_id = query.from_user.id
+    # Очищаем временные ответы
+    context.user_data['poll_answers'] = {}
+    # Начинаем заново с первого вопроса
+    poll = get_active_poll()
+    if not poll or poll['id'] != poll_id:
+        await query.edit_message_text("Опрос более не активен.")
+        return
+    meetings = poll['meetings']
+    if not meetings:
+        return
+    first_meeting = meetings[0]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да", callback_data=f"poll_{poll_id}_{first_meeting}_да_1"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"poll_{poll_id}_{first_meeting}_нет_1"),
+            InlineKeyboardButton("❓ Не знаю", callback_data=f"poll_{poll_id}_{first_meeting}_не знаю_1")
+        ]
+    ])
+    await query.edit_message_text(
+        f"📢 *Опрос заново*\n\n{poll['text']}\n\nВопрос 1 из {len(meetings)}:\n{first_meeting}",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
 
-# ---------- РЕЗУЛЬТАТЫ ДЛЯ АДМИНА ----------
+# ---------- РЕЗУЛЬТАТЫ ----------
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -458,7 +469,7 @@ async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result_text:
         await update.message.reply_text(result_text, parse_mode="Markdown")
 
-# ---------- ОБЫЧНЫЕ АДМИН-КОМАНДЫ ----------
+# ---------- ОБЩИЕ КОМАНДЫ ----------
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -508,7 +519,6 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("users", users_command))
@@ -518,10 +528,10 @@ def main():
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Обработчики
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_"))
+    app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
     app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
 
@@ -530,3 +540,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
