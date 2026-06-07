@@ -217,6 +217,23 @@ def deactivate_poll():
     cursor.execute("UPDATE polls SET is_active = 0")
     conn.commit()
     conn.close()
+    
+async def clean_polls_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    active_poll = get_active_poll()
+    if active_poll:
+        cursor.execute("DELETE FROM polls WHERE poll_id != ?", (active_poll['id'],))
+    else:
+        cursor.execute("DELETE FROM polls")
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("✅ Все неактивные опросы удалены. Активности (ГВГ) теперь только из текущего опроса.")
+    
 
 def save_responses(user_id, poll_id, responses_dict):
     conn = sqlite3.connect(DB_FILE)
@@ -301,24 +318,23 @@ def get_or_create_activity_sheet(spreadsheet):
     return ws
 
 def add_activity_column(ws, activity_name):
+    """Добавляет колонку активности, если её ещё нет, и возвращает её индекс (1-базированный)"""
     headers = ws.row_values(1)
     if activity_name in headers:
-        return False
+        return headers.index(activity_name) + 1
+    # Добавляем в конец
     col_num = len(headers) + 1
     ws.update_cell(1, col_num, activity_name)
-    return True
+    return col_num
 
 def mark_activity_for_nicks(ws, activity_name, nicks):
     all_values = ws.get_all_values()
     if not all_values:
         return 0
     headers = all_values[0]
-    try:
-        col_idx = headers.index(activity_name) + 1
-    except ValueError:
-        add_activity_column(ws, activity_name)
-        all_values = ws.get_all_values()
-        headers = all_values[0]
+    if activity_name not in headers:
+        col_idx = add_activity_column(ws, activity_name)
+    else:
         col_idx = headers.index(activity_name) + 1
     updated = 0
     for row_idx, row in enumerate(all_values[1:], start=2):
@@ -562,7 +578,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Нет активного опроса.")
     elif text == "🚫 Завершить опрос" and is_admin(user_id):
-        deactivate_poll()
+        ()
         await update.message.reply_text("Текущий опрос завершён.")
     elif text == "🏰 Управление кланом" and is_admin(user_id):
         await update.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
@@ -1210,7 +1226,8 @@ def main():
     app.add_handler(CallbackQueryHandler(delete_callback, pattern="^(confirm_del_|cancel_del)"))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
-
+    app.add_handler(CommandHandler("clean_polls", clean_polls_command))
+    
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
 
