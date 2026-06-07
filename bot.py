@@ -37,13 +37,21 @@ def init_db():
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Таблица users с полем class
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             nick TEXT NOT NULL,
+            class TEXT,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Добавляем колонку class, если её нет (для совместимости)
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'class' not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN class TEXT")
+    # Таблица опросов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS polls (
             poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +61,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Таблица ответов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS poll_responses (
             user_id INTEGER,
@@ -87,10 +96,10 @@ def is_registered(user_id):
     conn.close()
     return result is not None
 
-def register_user(user_id, nick):
+def register_user(user_id, nick, user_class):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (user_id, nick) VALUES (?, ?)", (user_id, nick))
+    cursor.execute("INSERT INTO users (user_id, nick, class) VALUES (?, ?, ?)", (user_id, nick, user_class))
     conn.commit()
     conn.close()
 
@@ -102,10 +111,18 @@ def get_user_nick(user_id):
     conn.close()
     return row[0] if row else None
 
+def get_user_class(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT class FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
 def get_all_users():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, nick, registered_at FROM users ORDER BY registered_at")
+    cursor.execute("SELECT user_id, nick, class, registered_at FROM users ORDER BY registered_at")
     users = cursor.fetchall()
     conn.close()
     return users
@@ -151,6 +168,21 @@ def save_responses(user_id, poll_id, responses_dict):
     conn.commit()
     conn.close()
 
+def get_responses_for_export(poll_id):
+    """Возвращает список кортежей (nick, class, meeting, answer) для экспорта в Google Sheets"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.nick, u.class, pr.meeting, pr.answer
+        FROM poll_responses pr
+        JOIN users u ON pr.user_id = u.user_id
+        WHERE pr.poll_id = ?
+        ORDER BY pr.meeting, u.nick
+    ''', (poll_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
 def get_response_summary(poll_id, meetings):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -169,7 +201,7 @@ def get_response_summary(poll_id, meetings):
             summary[meeting][nick] = answer
     return summary
 
-# ---------- GOOGLE SHEETS ----------
+# ---------- GOOGLE SHEETS (ЭКСПОРТ) ----------
 def get_google_sheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -191,67 +223,40 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступно только администратору.")
         return
 
-    # 1. Проверяем переменные окружения
     if not GOOGLE_CREDS_JSON:
-        logging.error("GOOGLE_CREDS не задана")
-        await update.message.reply_text("❌ Ошибка: переменная GOOGLE_CREDS не задана на хостинге.")
+        await update.message.reply_text("❌ Переменная GOOGLE_CREDS не задана.")
         return
     if not GOOGLE_SHEET_ID:
-        logging.error("GOOGLE_SHEET_ID не задан")
-        await update.message.reply_text("❌ Ошибка: переменная GOOGLE_SHEET_ID не задана на хостинге.")
+        await update.message.reply_text("❌ Переменная GOOGLE_SHEET_ID не задана.")
         return
 
-    # 2. Получаем активный опрос
     poll = get_active_poll()
     if not poll:
         await update.message.reply_text("Нет активного опроса для экспорта.")
         return
 
-    # 3. Подключаемся к Google Sheets
-    try:
-        sheet = get_google_sheet()
-        if sheet is None:
-            await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте логи.")
-            return
-    except Exception as e:
-        logging.error(f"Ошибка при получении sheet: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка подключения к Google Sheets. Подробности в логах.")
+    sheet = get_google_sheet()
+    if sheet is None:
+        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте логи.")
         return
 
-    # 4. Получаем сводку ответов
     try:
-        summary = get_response_summary(poll['id'], poll['meetings'])
-    except Exception as e:
-        logging.error(f"Ошибка получения сводки: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка при формировании данных опроса.")
-        return
-
-    # 5. Формируем данные для записи
-    try:
-        headers = ["Название опроса", "Текст опроса", "Встреча", "Ник", "Ответ"]
+        rows = get_responses_for_export(poll['id'])
+        # Формируем данные: ровно 4 столбца
+        headers = ["НАЗВАНИЕ БОССА", "НИК", "КЛАСС", "ОТВЕТ ПОЛЬЗОВАТЕЛЯ"]
         data = [headers]
-        for meeting in poll['meetings']:
-            responses = summary.get(meeting, {})
-            if responses:
-                for nick, answer in responses.items():
-                    data.append([f"Опрос {poll['id']}", poll['text'], meeting, nick, answer])
-            else:
-                data.append([f"Опрос {poll['id']}", poll['text'], meeting, "Нет ответов", "-"])
-    except Exception as e:
-        logging.error(f"Ошибка формирования data: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка подготовки данных.")
-        return
-
-    # 6. Очищаем и записываем в таблицу
-    try:
+        for nick, user_class, meeting, answer in rows:
+            data.append([meeting, nick, user_class if user_class else "Не указан", answer])
+        # Если нет ответов, добавим строку-заглушку
+        if len(data) == 1:
+            data.append(["Нет ответов", "", "", ""])
         sheet.clear()
-        logging.info("Лист очищен")
         sheet.update(values=data, range_name='A1')
-        logging.info(f"Записано {len(data)} строк")
-        await update.message.reply_text("✅ Результаты опроса успешно выгружены в Google Таблицу!")
+        await update.message.reply_text("✅ Результаты опроса выгружены в Google Таблицу!")
     except Exception as e:
-        logging.error(f"Ошибка при записи в Google Sheets: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка при записи в Google Sheets. Проверьте права доступа к таблице и корректность GOOGLE_CREDS.")
+        logging.error(f"Ошибка при записи: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка при записи в Google Sheets. Проверьте права доступа и корректность GOOGLE_CREDS.")
+
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [[KeyboardButton("👤 Мой профиль"), KeyboardButton("❓ Помощь")]]
@@ -268,40 +273,71 @@ def get_admin_keyboard():
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ ----------
+def get_class_keyboard():
+    classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+    # Разбиваем на ряды по 3 кнопки
+    keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+# ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЕЙ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_registered(user_id):
         nick = get_user_nick(user_id)
-        await update.message.reply_text(f"С возвращением, {nick}!", reply_markup=get_main_keyboard(user_id))
+        user_class = get_user_class(user_id)
+        await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
     else:
         context.user_data['awaiting_nick'] = True
         await update.message.reply_text(
-            "Привет! Вы не зарегистрированы.\nПожалуйста, введите свой ник из списка."
+            "Привет! Вы не зарегистрированы.\n"
+            "Пожалуйста, введите свой ник из списка."
         )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
+    # Этап 1: ожидание ввода ника
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
         whitelist = load_whitelist()
         if nick in whitelist:
-            register_user(user_id, nick)
+            # Запоминаем ник, переходим к выбору класса
+            context.user_data['temp_nick'] = nick
             context.user_data['awaiting_nick'] = False
-            await update.message.reply_text(f"Отлично, {nick}! Вы зарегистрированы.", reply_markup=get_main_keyboard(user_id))
+            context.user_data['awaiting_class'] = True
+            await update.message.reply_text(
+                "Ник принят. Теперь выберите класс персонажа:",
+                reply_markup=get_class_keyboard()
+            )
         else:
             await update.message.reply_text("Ник не найден в белом списке. Попробуйте ещё раз.")
         return
 
+    # Этап 2: ожидание выбора класса
+    if context.user_data.get('awaiting_class'):
+        if text in ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]:
+            user_class = text
+            nick = context.user_data.pop('temp_nick')
+            register_user(user_id, nick, user_class)
+            context.user_data.pop('awaiting_class', None)
+            await update.message.reply_text(
+                f"Отлично, {nick} (класс {user_class})! Вы зарегистрированы.",
+                reply_markup=get_main_keyboard(user_id)
+            )
+        else:
+            await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
+        return
+
+    # Основное меню (для зарегистрированных)
     if not is_registered(user_id):
         await update.message.reply_text("Пожалуйста, начните с /start для регистрации.")
         return
 
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
-        await update.message.reply_text(f"Ваш ник: {nick}\nВаш Telegram ID: `{user_id}`", parse_mode="Markdown")
+        user_class = get_user_class(user_id)
+        await update.message.reply_text(f"Ваш ник: {nick}\nКласс: {user_class}\nTelegram ID: `{user_id}`", parse_mode="Markdown")
     elif text == "❓ Помощь":
         await update.message.reply_text("Используйте кнопки меню. /start — показать меню.")
     elif text == "📊 Админ-панель" and is_admin(user_id):
@@ -334,8 +370,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет пользователей.")
             return
         msg = "📋 *Список пользователей:*\n"
-        for uid, nick, reg_date in users:
-            msg += f"• {nick} (ID: `{uid}`) — {reg_date}\n"
+        for uid, nick, user_class, reg_date in users:
+            msg += f"• {nick} (класс: {user_class or '?'}, ID: `{uid}`) — {reg_date}\n"
             if len(msg) > 3800:
                 await update.message.reply_text(msg, parse_mode="Markdown")
                 msg = ""
@@ -343,11 +379,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="Markdown")
     elif text == "🔢 Количество" and is_admin(user_id):
         count = len(get_all_users())
-        await update.message.reply_text(f"👥 Зарегистрировано: {count}")
+        await update.message.reply_text(f"👥 Зарегистрировано пользователей: {count}")
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
-# ---------- СОЗДАНИЕ ОПРОСА ----------
+# ---------- СОЗДАНИЕ ОПРОСА (АДМИН) ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) or 'poll_creation' not in context.user_data:
@@ -385,7 +421,7 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
     await query.edit_message_text(f"✅ Опрос создан!\n\nТекст: {data['text']}\nВстречи: {', '.join(data['meetings'])}")
     del context.user_data['poll_creation']
 
-# ---------- РАССЫЛКА ОПРОСА (последовательная, без глобального хранилища) ----------
+# ---------- РАССЫЛКА ОПРОСА (ПОСЛЕДОВАТЕЛЬНАЯ) ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -402,7 +438,7 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"Начинаю рассылку опроса {len(users)} пользователям...")
     success = 0
-    for uid, nick, _ in users:
+    for uid, nick, _, _ in users:
         try:
             await send_first_question(uid, poll, context)
             success += 1
@@ -438,10 +474,9 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Ошибка: некорректные данные.")
         return
     poll_id = int(parts[1])
-    # meeting может содержать подчёркивания, поэтому собираем всё между poll_id и answer
+    # Ищем, где начинается ответ (да/нет/не знаю)
     answer_idx = -2
     next_idx_str = parts[-1]
-    # Ищем, где начинается answer: один из "да","нет","не знаю"
     answer_str = None
     for i, p in enumerate(parts):
         if p in ('да', 'нет', 'не знаю'):
@@ -451,7 +486,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if answer_str is None:
         await query.edit_message_text("Ошибка: не распознан ответ.")
         return
-    meeting = '_'.join(parts[2:answer_idx])  # всё, что между poll_id и ответом
+    meeting = '_'.join(parts[2:answer_idx])  # название встречи может содержать _
     next_index = int(next_idx_str)
     user_id = query.from_user.id
     if not is_registered(user_id):
@@ -538,7 +573,7 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-# ---------- РЕЗУЛЬТАТЫ (текстовые) ----------
+# ---------- РЕЗУЛЬТАТЫ (ТЕКСТОВЫЕ) ----------
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -576,8 +611,8 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет пользователей.")
         return
     msg = "📋 *Список пользователей:*\n"
-    for uid, nick, reg_date in users:
-        msg += f"• {nick} (ID: `{uid}`) — {reg_date}\n"
+    for uid, nick, user_class, reg_date in users:
+        msg += f"• {nick} (класс: {user_class or '?'}, ID: `{uid}`) — {reg_date}\n"
         if len(msg) > 3800:
             await update.message.reply_text(msg, parse_mode="Markdown")
             msg = ""
