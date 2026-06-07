@@ -131,7 +131,6 @@ def deactivate_poll():
     conn.close()
 
 def save_responses(user_id, poll_id, responses_dict):
-    """responses_dict = {meeting: answer}"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     for meeting, answer in responses_dict.items():
@@ -141,14 +140,6 @@ def save_responses(user_id, poll_id, responses_dict):
         ''', (user_id, poll_id, meeting, answer))
     conn.commit()
     conn.close()
-
-def get_user_responses_for_poll(user_id, poll_id):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT meeting, answer FROM poll_responses WHERE user_id = ? AND poll_id = ?", (user_id, poll_id))
-    rows = cursor.fetchall()
-    conn.close()
-    return {meeting: answer for meeting, answer in rows}
 
 def get_response_summary(poll_id, meetings):
     conn = sqlite3.connect(DB_FILE)
@@ -185,7 +176,6 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_meeting_keyboard(poll_id, meeting, index, total):
-    """Inline-клавиатура для ответа на одну встречу"""
     keyboard = [
         [
             InlineKeyboardButton("✅ Да", callback_data=f"poll_{poll_id}_{meeting}_да"),
@@ -196,7 +186,6 @@ def get_meeting_keyboard(poll_id, meeting, index, total):
     return InlineKeyboardMarkup(keyboard)
 
 def get_confirm_keyboard():
-    """Клавиатура для подтверждения ответов"""
     keyboard = [
         [InlineKeyboardButton("✅ Да, всё верно", callback_data="confirm_yes")],
         [InlineKeyboardButton("❌ Нет, пройти заново", callback_data="confirm_no")]
@@ -342,45 +331,42 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Начинаю последовательную рассылку опроса {len(users)} пользователям...")
     success = 0
     for uid, nick, _ in users:
-        # Инициализируем сессию опроса для пользователя
-        context.application.chat_data[uid] = {
+        # Сохраняем состояние опроса для пользователя в user_data приложения
+        context.application.user_data[uid] = {
             'poll_id': poll['id'],
             'meetings': poll['meetings'],
             'current_index': 0,
             'temp_answers': {}
         }
         try:
-            # Отправляем первый вопрос
-            await send_next_question(uid, context.application.bot, context)
+            await send_next_question(uid, context)  # передаём context, внутри будем брать bot
             success += 1
         except Exception as e:
             logging.error(f"Не удалось начать опрос для {uid}: {e}")
     await update.message.reply_text(f"Рассылка инициирована. Отправлено первое сообщение {success} из {len(users)} пользователям.")
 
-async def send_next_question(chat_id, bot, context):
-    """Отправляет следующий вопрос пользователю, если есть неотвеченные встречи"""
-    user_data = context.application.chat_data.get(chat_id)
+async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет следующий вопрос пользователю, используя данные из context.application.user_data"""
+    user_data = context.application.user_data.get(user_id)
     if not user_data:
         return
     idx = user_data['current_index']
     meetings = user_data['meetings']
     if idx >= len(meetings):
-        # Все встречи пройдены — показываем сводку
-        await show_confirmation(chat_id, bot, context)
+        await show_confirmation(user_id, context)
         return
     meeting = meetings[idx]
     poll_id = user_data['poll_id']
     keyboard = get_meeting_keyboard(poll_id, meeting, idx+1, len(meetings))
-    await bot.send_message(
-        chat_id=chat_id,
+    await context.bot.send_message(
+        chat_id=user_id,
         text=f"📋 *Вопрос {idx+1} из {len(meetings)}*\n\n{meeting}\n\nВаш ответ:",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
 
-async def show_confirmation(chat_id, bot, context):
-    """Показывает сводку ответов и кнопки подтверждения"""
-    user_data = context.application.chat_data.get(chat_id)
+async def show_confirmation(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    user_data = context.application.user_data.get(user_id)
     if not user_data:
         return
     answers = user_data['temp_answers']
@@ -391,10 +377,9 @@ async def show_confirmation(chat_id, bot, context):
         text += f"• {m} → {ans}\n"
     text += "\nВсё верно?"
     keyboard = get_confirm_keyboard()
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
+    await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
 
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ответа на конкретную встречу"""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -409,7 +394,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Вы не зарегистрированы. Напишите /start")
         return
 
-    user_data = context.application.chat_data.get(user_id)
+    user_data = context.application.user_data.get(user_id)
     if not user_data or user_data['poll_id'] != poll_id:
         await query.edit_message_text("Этот опрос уже не активен или не найден. Начните заново с /start.")
         return
@@ -422,14 +407,13 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"✅ Ваш ответ на '{meeting}': {answer}\n\nСпасибо!")
 
     # Отправляем следующий вопрос
-    await send_next_question(user_id, context.bot, context)
+    await send_next_question(user_id, context)
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение или отказ от ответов"""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    user_data = context.application.chat_data.get(user_id)
+    user_data = context.application.user_data.get(user_id)
     if not user_data:
         await query.edit_message_text("Нет активного опроса.")
         return
@@ -439,13 +423,13 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_responses(user_id, user_data['poll_id'], user_data['temp_answers'])
         await query.edit_message_text("✅ Спасибо! Ваши ответы сохранены. Опрос завершён.")
         # Очищаем сессию
-        del context.application.chat_data[user_id]
+        del context.application.user_data[user_id]
     elif query.data == "confirm_no":
         # Сбрасываем и начинаем заново
         user_data['temp_answers'] = {}
         user_data['current_index'] = 0
         await query.edit_message_text("🔄 Начинаем опрос заново. Пожалуйста, ответьте на вопросы.")
-        await send_next_question(user_id, context.bot, context)
+        await send_next_question(user_id, context)
 
 # ---------- РЕЗУЛЬТАТЫ ДЛЯ АДМИНА ----------
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
