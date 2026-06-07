@@ -3,7 +3,6 @@ import logging
 import os
 import json
 import traceback
-from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
@@ -37,7 +36,6 @@ def init_db():
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Таблица users с полем class
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -46,12 +44,10 @@ def init_db():
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Добавляем колонку class, если её нет (для совместимости)
     cursor.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'class' not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN class TEXT")
-    # Таблица опросов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS polls (
             poll_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +57,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Таблица ответов
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS poll_responses (
             user_id INTEGER,
@@ -75,19 +70,26 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---------- ПОЛЬЗОВАТЕЛИ ----------
+# ---------- БЕЛЫЙ СПИСОК ----------
 def load_whitelist():
+    """Возвращает set() ников из whitelist.txt (в нижнем регистре)"""
     whitelist = set()
     try:
         with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
             for line in f:
                 nick = line.strip()
                 if nick:
-                    whitelist.add(nick)
+                    whitelist.add(nick.lower())
     except FileNotFoundError:
         logging.error(f"Файл {WHITELIST_FILE} не найден!")
     return whitelist
 
+def is_nick_in_whitelist(nick):
+    """Проверяет, есть ли ник в белом списке (без учёта регистра)"""
+    whitelist = load_whitelist()
+    return nick.lower() in whitelist
+
+# ---------- ПОЛЬЗОВАТЕЛИ ----------
 def is_registered(user_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -95,13 +97,6 @@ def is_registered(user_id):
     result = cursor.fetchone()
     conn.close()
     return result is not None
-
-def register_user(user_id, nick, user_class):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (user_id, nick, class) VALUES (?, ?, ?)", (user_id, nick, user_class))
-    conn.commit()
-    conn.close()
 
 def get_user_nick(user_id):
     conn = sqlite3.connect(DB_FILE)
@@ -119,6 +114,22 @@ def get_user_class(user_id):
     conn.close()
     return row[0] if row else None
 
+def delete_user(user_id):
+    """Удаляет пользователя и его ответы на опросы"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM poll_responses WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def register_user(user_id, nick, user_class):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO users (user_id, nick, class) VALUES (?, ?, ?)", (user_id, nick, user_class))
+    conn.commit()
+    conn.close()
+
 def get_all_users():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -129,6 +140,34 @@ def get_all_users():
 
 def is_admin(user_id):
     return user_id in ADMIN_LIST
+
+def is_user_valid(user_id):
+    """Проверяет, зарегистрирован ли пользователь и его ник в белом списке"""
+    if not is_registered(user_id):
+        return False
+    nick = get_user_nick(user_id)
+    if not nick:
+        return False
+    if not is_nick_in_whitelist(nick):
+        # Ник удалён из белого списка – удаляем пользователя из БД
+        delete_user(user_id)
+        return False
+    return True
+
+async def sync_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админская команда: удаляет всех пользователей, чьи ники отсутствуют в whitelist.txt"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    whitelist = load_whitelist()
+    users = get_all_users()
+    deleted = 0
+    for uid, nick, _, _ in users:
+        if nick.lower() not in whitelist:
+            delete_user(uid)
+            deleted += 1
+    await update.message.reply_text(f"Синхронизация завершена. Удалено пользователей: {deleted}")
 
 # ---------- ОПРОСЫ ----------
 def create_poll(text, meetings):
@@ -169,7 +208,7 @@ def save_responses(user_id, poll_id, responses_dict):
     conn.close()
 
 def get_responses_for_export(poll_id):
-    """Возвращает список кортежей (nick, class, meeting, answer) для экспорта в Google Sheets"""
+    """Возвращает список (nick, class, meeting, answer) для выгрузки"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -201,7 +240,7 @@ def get_response_summary(poll_id, meetings):
             summary[meeting][nick] = answer
     return summary
 
-# ---------- GOOGLE SHEETS (ЭКСПОРТ) ----------
+# ---------- GOOGLE SHEETS ----------
 def get_google_sheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -223,11 +262,8 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступно только администратору.")
         return
 
-    if not GOOGLE_CREDS_JSON:
-        await update.message.reply_text("❌ Переменная GOOGLE_CREDS не задана.")
-        return
-    if not GOOGLE_SHEET_ID:
-        await update.message.reply_text("❌ Переменная GOOGLE_SHEET_ID не задана.")
+    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        await update.message.reply_text("❌ Не заданы переменные GOOGLE_CREDS или GOOGLE_SHEET_ID.")
         return
 
     poll = get_active_poll()
@@ -237,17 +273,15 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sheet = get_google_sheet()
     if sheet is None:
-        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте логи.")
+        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
         return
 
     try:
         rows = get_responses_for_export(poll['id'])
-        # Формируем данные: ровно 4 столбца
-        headers = ["НАЗВАНИЕ БОССА", "НИК", "КЛАСС", "ОТВЕТ ПОЛЬЗОВАТЕЛЯ"]
+        headers = ["Название босса", "Ник", "Класс", "Ответ пользователя"]
         data = [headers]
         for nick, user_class, meeting, answer in rows:
             data.append([meeting, nick, user_class if user_class else "Не указан", answer])
-        # Если нет ответов, добавим строку-заглушку
         if len(data) == 1:
             data.append(["Нет ответов", "", "", ""])
         sheet.clear()
@@ -255,7 +289,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Результаты опроса выгружены в Google Таблицу!")
     except Exception as e:
         logging.error(f"Ошибка при записи: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка при записи в Google Sheets. Проверьте права доступа и корректность GOOGLE_CREDS.")
+        await update.message.reply_text("❌ Ошибка при записи в Google Sheets. Проверьте права доступа.")
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
@@ -275,11 +309,10 @@ def get_admin_keyboard():
 
 def get_class_keyboard():
     classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
-    # Разбиваем на ряды по 3 кнопки
     keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЕЙ ----------
+# ---------- ОБРАБОТЧИКИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_registered(user_id):
@@ -289,8 +322,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         context.user_data['awaiting_nick'] = True
         await update.message.reply_text(
-            "Привет! Вы не зарегистрированы.\n"
-            "Пожалуйста, введите свой ник из списка."
+            "Привет! Вы не зарегистрированы.\nПожалуйста, введите свой ник из списка."
         )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,13 +333,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
         whitelist = load_whitelist()
-        if nick in whitelist:
-            # Запоминаем ник, переходим к выбору класса
+        if nick.lower() in whitelist:
+            # Сохраняем ник, ждём выбора класса
             context.user_data['temp_nick'] = nick
             context.user_data['awaiting_nick'] = False
             context.user_data['awaiting_class'] = True
             await update.message.reply_text(
-                "Ник принят. Теперь выберите класс персонажа:",
+                "Отлично! Теперь выберите класс вашего персонажа:",
                 reply_markup=get_class_keyboard()
             )
         else:
@@ -316,28 +348,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Этап 2: ожидание выбора класса
     if context.user_data.get('awaiting_class'):
-        if text in ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]:
-            user_class = text
+        valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+        if text in valid_classes:
             nick = context.user_data.pop('temp_nick')
+            user_class = text
             register_user(user_id, nick, user_class)
             context.user_data.pop('awaiting_class', None)
             await update.message.reply_text(
-                f"Отлично, {nick} (класс {user_class})! Вы зарегистрированы.",
+                f"Регистрация завершена!\nНик: {nick}\nКласс: {user_class}",
                 reply_markup=get_main_keyboard(user_id)
             )
         else:
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
 
-    # Основное меню (для зарегистрированных)
-    if not is_registered(user_id):
-        await update.message.reply_text("Пожалуйста, начните с /start для регистрации.")
+    # Основное меню (проверяем валидность пользователя)
+    if not is_user_valid(user_id):
+        await update.message.reply_text(
+            "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
+            "Для повторной регистрации нажмите /start."
+        )
         return
 
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
-        await update.message.reply_text(f"Ваш ник: {nick}\nКласс: {user_class}\nTelegram ID: `{user_id}`", parse_mode="Markdown")
+        await update.message.reply_text(f"Ваш ник: {nick}\nВаш класс: {user_class}\nВаш Telegram ID: `{user_id}`", parse_mode="Markdown")
     elif text == "❓ Помощь":
         await update.message.reply_text("Используйте кнопки меню. /start — показать меню.")
     elif text == "📊 Админ-панель" and is_admin(user_id):
@@ -371,7 +407,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         msg = "📋 *Список пользователей:*\n"
         for uid, nick, user_class, reg_date in users:
-            msg += f"• {nick} (класс: {user_class or '?'}, ID: `{uid}`) — {reg_date}\n"
+            msg += f"• {nick} (класс: {user_class}) (ID: `{uid}`) — {reg_date}\n"
             if len(msg) > 3800:
                 await update.message.reply_text(msg, parse_mode="Markdown")
                 msg = ""
@@ -379,11 +415,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, parse_mode="Markdown")
     elif text == "🔢 Количество" and is_admin(user_id):
         count = len(get_all_users())
-        await update.message.reply_text(f"👥 Зарегистрировано пользователей: {count}")
+        await update.message.reply_text(f"👥 Зарегистрировано: {count}")
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
-# ---------- СОЗДАНИЕ ОПРОСА (АДМИН) ----------
+# ---------- СОЗДАНИЕ ОПРОСА (админ) ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) or 'poll_creation' not in context.user_data:
@@ -421,7 +457,7 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
     await query.edit_message_text(f"✅ Опрос создан!\n\nТекст: {data['text']}\nВстречи: {', '.join(data['meetings'])}")
     del context.user_data['poll_creation']
 
-# ---------- РАССЫЛКА ОПРОСА (ПОСЛЕДОВАТЕЛЬНАЯ) ----------
+# ---------- РАССЫЛКА ОПРОСА (последовательная) ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -439,6 +475,10 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Начинаю рассылку опроса {len(users)} пользователям...")
     success = 0
     for uid, nick, _, _ in users:
+        # Проверяем, что пользователь всё ещё валиден (ник в whitelist)
+        if not is_user_valid(uid):
+            logging.info(f"Пользователь {uid} ({nick}) пропущен: ник не в белом списке")
+            continue
         try:
             await send_first_question(uid, poll, context)
             success += 1
@@ -469,15 +509,23 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = query.from_user.id
+
+    # Проверка валидности пользователя перед обработкой ответа
+    if not is_user_valid(user_id):
+        await query.edit_message_text(
+            "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
+            "Для повторной регистрации нажмите /start."
+        )
+        return
+
     parts = data.split('_')
     if len(parts) < 5 or parts[0] != 'poll':
         await query.edit_message_text("Ошибка: некорректные данные.")
         return
     poll_id = int(parts[1])
-    # Ищем, где начинается ответ (да/нет/не знаю)
+    # Определяем ответ
     answer_idx = -2
-    next_idx_str = parts[-1]
-    answer_str = None
     for i, p in enumerate(parts):
         if p in ('да', 'нет', 'не знаю'):
             answer_str = p
@@ -486,12 +534,8 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if answer_str is None:
         await query.edit_message_text("Ошибка: не распознан ответ.")
         return
-    meeting = '_'.join(parts[2:answer_idx])  # название встречи может содержать _
-    next_index = int(next_idx_str)
-    user_id = query.from_user.id
-    if not is_registered(user_id):
-        await query.edit_message_text("Вы не зарегистрированы. Напишите /start")
-        return
+    meeting = '_'.join(parts[2:answer_idx])
+    next_index = int(parts[-1])
 
     poll = get_active_poll()
     if not poll or poll['id'] != poll_id:
@@ -504,7 +548,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['poll_answers'][meeting] = answer_str
 
     if next_index >= len(meetings):
-        # Показать сводку
+        # Сводка
         summary_text = "✅ *Ваши ответы:*\n\n"
         for m in meetings:
             ans = context.user_data['poll_answers'].get(m, "❌ Не отвечен")
@@ -534,9 +578,15 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
+    if not is_user_valid(user_id):
+        await query.edit_message_text(
+            "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
+            "Для повторной регистрации нажмите /start."
+        )
+        return
     data = query.data
     poll_id = int(data.split('_')[1])
-    user_id = query.from_user.id
     answers = context.user_data.get('poll_answers', {})
     if not answers:
         await query.edit_message_text("Нет данных для сохранения.")
@@ -548,9 +598,15 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
+    if not is_user_valid(user_id):
+        await query.edit_message_text(
+            "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
+            "Для повторной регистрации нажмите /start."
+        )
+        return
     data = query.data
     poll_id = int(data.split('_')[1])
-    user_id = query.from_user.id
     context.user_data['poll_answers'] = {}
     poll = get_active_poll()
     if not poll or poll['id'] != poll_id:
@@ -573,7 +629,7 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-# ---------- РЕЗУЛЬТАТЫ (ТЕКСТОВЫЕ) ----------
+# ---------- РЕЗУЛЬТАТЫ (текстовые) ----------
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -612,7 +668,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = "📋 *Список пользователей:*\n"
     for uid, nick, user_class, reg_date in users:
-        msg += f"• {nick} (класс: {user_class or '?'}, ID: `{uid}`) — {reg_date}\n"
+        msg += f"• {nick} (класс: {user_class}) (ID: `{uid}`) — {reg_date}\n"
         if len(msg) > 3800:
             await update.message.reply_text(msg, parse_mode="Markdown")
             msg = ""
@@ -629,8 +685,11 @@ async def count_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_registered(user_id):
-        await update.message.reply_text("Вы не зарегистрированы. Напишите /start.")
+    if not is_user_valid(user_id):
+        await update.message.reply_text(
+            "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
+            "Для повторной регистрации нажмите /start."
+        )
         return
     await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
 
@@ -659,6 +718,7 @@ def main():
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CommandHandler("sync_whitelist", sync_whitelist_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
