@@ -300,7 +300,71 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets. Проверьте логи.")
 
-# ---------- РЕДАКТИРОВАНИЕ/УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ----------
+# ---------- УПРАВЛЕНИЕ КЛАНОМ: УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ----------
+async def delete_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    users = get_all_users()
+    if not users:
+        await update.message.reply_text("Нет зарегистрированных пользователей.")
+        return
+    context.user_data['delete_user_list'] = [(uid, nick) for uid, nick, _, _ in users]
+    keyboard = []
+    for uid, nick in context.user_data['delete_user_list']:
+        keyboard.append([KeyboardButton(f"❌ {nick}")])
+    keyboard.append([KeyboardButton("🔙 Назад")])
+    await update.message.reply_text("Выберите пользователя для удаления:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+
+async def confirm_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    text = update.message.text
+    if text == "🔙 Назад":
+        context.user_data.pop('delete_user_list', None)
+        await update.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
+        return
+    if text.startswith("❌ "):
+        nick_to_delete = text[2:]
+        target_user_id = get_user_id_by_nick(nick_to_delete)
+        if not target_user_id:
+            await update.message.reply_text("Пользователь не найден.")
+            await delete_user_command(update, context)
+            return
+        context.user_data['confirm_delete'] = {'user_id': target_user_id, 'nick': nick_to_delete}
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{target_user_id}")],
+            [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_del")]
+        ])
+        await update.message.reply_text(f"Вы действительно хотите удалить пользователя {nick_to_delete}? Все его ответы на опросы будут потеряны.", reply_markup=keyboard)
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.edit_message_text("Доступно только администратору.")
+        return
+    data = query.data
+    if data.startswith("confirm_del_"):
+        target_user_id = int(data.split('_')[2])
+        nick = get_user_nick(target_user_id)
+        if nick:
+            delete_user(target_user_id)
+            await query.edit_message_text(f"✅ Пользователь {nick} удалён.")
+        else:
+            await query.edit_message_text("Пользователь не найден.")
+        context.user_data.pop('delete_user_list', None)
+        context.user_data.pop('confirm_delete', None)
+        await query.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
+    elif data == "cancel_del":
+        await query.edit_message_text("Удаление отменено.")
+        context.user_data.pop('confirm_delete', None)
+        await delete_user_command(update, context)
+
+# ---------- РЕДАКТИРОВАНИЕ КЛАССА ----------
 async def edit_class_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -326,7 +390,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_nick = text
         target_user_id = get_user_id_by_nick(target_nick)
         if not target_user_id:
-            await update.message.reply_text(f"Пользователь с ником {target_nick} не найден в БД. Попробуйте ещё раз или /cancel.")
+            await update.message.reply_text(f"Пользователь с ником {target_nick} не найден. Попробуйте ещё раз или /cancel.")
             return
         context.user_data['edit_class_nick'] = target_nick
         context.user_data['edit_class_user_id'] = target_user_id
@@ -349,68 +413,6 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_mode', None)
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
-
-async def delete_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    users = get_all_users()
-    if not users:
-        await update.message.reply_text("Нет зарегистрированных пользователей.")
-        return
-    # Сохраняем список пользователей в context.user_data для последующего выбора
-    context.user_data['delete_user_list'] = [(uid, nick) for uid, nick, _, _ in users]
-    keyboard = []
-    for uid, nick in context.user_data['delete_user_list']:
-        keyboard.append([KeyboardButton(f"❌ {nick}")])
-    keyboard.append([KeyboardButton("🔙 Назад")])
-    await update.message.reply_text("Выберите пользователя для удаления:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-
-async def confirm_delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-    text = update.message.text
-    if text == "🔙 Назад":
-        context.user_data.pop('delete_user_list', None)
-        await update.message.reply_text("Отмена удаления.", reply_markup=get_admin_keyboard())
-        return
-    if text.startswith("❌ "):
-        nick_to_delete = text[2:]
-        target_user_id = get_user_id_by_nick(nick_to_delete)
-        if not target_user_id:
-            await update.message.reply_text("Пользователь не найден.")
-            return
-        # Сохраняем в context.user_data для подтверждения
-        context.user_data['confirm_delete'] = {'user_id': target_user_id, 'nick': nick_to_delete}
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_del_{target_user_id}")],
-            [InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_del")]
-        ])
-        await update.message.reply_text(f"Вы действительно хотите удалить пользователя {nick_to_delete}? Все его ответы на опросы будут потеряны.", reply_markup=keyboard)
-
-async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if not is_admin(user_id):
-        await query.edit_message_text("Доступно только администратору.")
-        return
-    data = query.data
-    if data.startswith("confirm_del_"):
-        target_user_id = int(data.split('_')[2])
-        nick = get_user_nick(target_user_id)
-        if nick:
-            delete_user(target_user_id)
-            await query.edit_message_text(f"Пользователь {nick} удалён.")
-        else:
-            await query.edit_message_text("Пользователь не найден.")
-        context.user_data.pop('confirm_delete', None)
-        context.user_data.pop('delete_user_list', None)
-    elif data == "cancel_del":
-        await query.edit_message_text("Удаление отменено.")
-        context.user_data.pop('confirm_delete', None)
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
