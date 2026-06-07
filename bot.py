@@ -3,9 +3,15 @@ import logging
 import os
 import json
 import traceback
+import re
 from datetime import datetime
+from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+# OCR
+import pytesseract
+from PIL import Image
 
 # Google Sheets
 import gspread
@@ -23,8 +29,13 @@ WHITELIST_FILE = "whitelist.txt"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_FILE = os.path.join(DATA_DIR, "users.db")
 
+# Google Sheets
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+
+# Для Tesseract (путь может отличаться на хостинге)
+# На Bothost обычно /usr/bin/tesseract
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 # =============================================
 
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +88,14 @@ def init_db():
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             reviewed_at TIMESTAMP
+        )
+    ''')
+    # Таблица для хранения всех встреч (активностей) – используется для выбора при загрузке активности
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS activities (
+            activity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
@@ -184,36 +203,6 @@ def is_user_valid(user_id):
         return False
     return True
 
-# ---------- КЕШ-ЗАЯВКИ ----------
-def create_cash_order(user_id, nick, photo_file_id, description):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status)
-        VALUES (?, ?, ?, ?, 'pending')
-    ''', (user_id, nick, photo_file_id, description))
-    conn.commit()
-    conn.close()
-
-def get_pending_orders():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT order_id, user_id, nick, photo_file_id, description FROM cash_orders WHERE status = 'pending' ORDER BY created_at")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def update_order_status(order_id, status):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE cash_orders SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE order_id = ?", (status, order_id))
-    conn.commit()
-    conn.close()
-
-def get_next_pending_order():
-    orders = get_pending_orders()
-    return orders[0] if orders else None
-
 # ---------- ОПРОСЫ ----------
 def create_poll(text, meetings):
     conn = sqlite3.connect(DB_FILE)
@@ -252,6 +241,148 @@ def save_responses(user_id, poll_id, responses_dict):
     conn.commit()
     conn.close()
 
+def get_all_polls_meetings():
+    """Возвращает список всех уникальных встреч (названий ГВГ) из всех опросов"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT meetings_json FROM polls")
+    rows = cursor.fetchall()
+    conn.close()
+    meetings_set = set()
+    for row in rows:
+        meetings = json.loads(row[0])
+        for m in meetings:
+            meetings_set.add(m)
+    return sorted(meetings_set)
+
+# ---------- АКТИВНОСТЬ ИГРОКОВ (OCR + Google Sheets) ----------
+def get_or_create_activity_sheet(spreadsheet):
+    """Возвращает worksheet 'Активность игроков', создаёт если нет"""
+    sheet_name = "Активность игроков"
+    try:
+        ws = spreadsheet.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="100")
+        # Заполняем первый столбец никами из whitelist.txt
+        whitelist = load_whitelist()
+        nicks_sorted = sorted(whitelist)
+        for i, nick in enumerate(nicks_sorted, start=1):
+            ws.update_cell(i, 1, nick)
+    return ws
+
+def get_activity_headers(ws):
+    """Возвращает список названий активностей (столбцы начиная со 2)"""
+    all_values = ws.get_all_values()
+    if not all_values or len(all_values) == 0:
+        return []
+    headers = all_values[0][1:]  # первый столбец – ники, дальше активности
+    return headers
+
+def add_activity_column(ws, activity_name):
+    """Добавляет новый столбец с названием активности (если ещё нет)"""
+    headers = get_activity_headers(ws)
+    if activity_name in headers:
+        return False
+    # Определяем новый номер столбца
+    col_num = len(headers) + 2  # +2 т.к. первый столбец ники
+    ws.update_cell(1, col_num, activity_name)
+    return True
+
+def mark_activity_for_nicks(ws, activity_name, nicks):
+    """Ставит '+' в ячейке для каждого ника в столбце activity_name"""
+    # Находим колонку активности
+    all_values = ws.get_all_values()
+    if not all_values:
+        return False
+    headers = all_values[0]
+    try:
+        col_idx = headers.index(activity_name) + 1  # +1 потому что gspread считает с 1
+    except ValueError:
+        # Если колонки нет – создаём
+        add_activity_column(ws, activity_name)
+        # Обновляем заголовки
+        all_values = ws.get_all_values()
+        headers = all_values[0]
+        col_idx = headers.index(activity_name) + 1
+
+    # Проходим по строкам, ищем ник
+    updated = 0
+    for row_idx, row in enumerate(all_values[1:], start=2):
+        nick_in_sheet = row[0].strip()
+        if nick_in_sheet.lower() in [n.lower() for n in nicks]:
+            ws.update_cell(row_idx, col_idx, "+")
+            updated += 1
+    return updated
+
+# ---------- OCR распознавание ников ----------
+def extract_nicks_from_image(image_bytes):
+    """Возвращает список ников, распознанных с картинки (строки)"""
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        # Конвертируем в RGB (на всякий случай)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        # Распознаём русский+английский
+        text = pytesseract.image_to_string(image, lang='rus+eng', config='--psm 6')
+        # Разбиваем на строки, убираем лишние пробелы
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        # Дополнительная фильтрация: убираем слишком короткие строки (меньше 2 символов) и числа
+        nicks = []
+        for line in lines:
+            # Проверяем, что строка не состоит только из цифр
+            if len(line) >= 2 and not line.isdigit():
+                nicks.append(line)
+        return nicks
+    except Exception as e:
+        logging.error(f"OCR ошибка: {e}")
+        return []
+
+# ---------- КЕШ-ЗАЯВКИ ----------
+def create_cash_order(user_id, nick, photo_file_id, description):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status)
+        VALUES (?, ?, ?, ?, 'pending')
+    ''', (user_id, nick, photo_file_id, description))
+    conn.commit()
+    conn.close()
+
+def get_pending_orders():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, user_id, nick, photo_file_id, description FROM cash_orders WHERE status = 'pending' ORDER BY created_at")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def update_order_status(order_id, status):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE cash_orders SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE order_id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+def get_next_pending_order():
+    orders = get_pending_orders()
+    return orders[0] if orders else None
+
+# ---------- GOOGLE SHEETS (экспорт опросов) ----------
+def get_google_spreadsheet():
+    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        logging.error("Переменные окружения для Google Sheets не заданы")
+        return None
+    try:
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        return spreadsheet
+    except Exception as e:
+        logging.error(f"Ошибка подключения: {e}")
+        return None
+
 def get_responses_grouped_by_meeting(poll_id):
     grouped = {}
     conn = sqlite3.connect(DB_FILE)
@@ -280,22 +411,6 @@ def sanitize_sheet_name(name):
     if not name:
         name = "Лист"
     return name
-
-# ---------- GOOGLE SHEETS ----------
-def get_google_spreadsheet():
-    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
-        logging.error("Переменные окружения для Google Sheets не заданы")
-        return None
-    try:
-        creds_info = json.loads(GOOGLE_CREDS_JSON)
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
-        return spreadsheet
-    except Exception as e:
-        logging.error(f"Ошибка подключения: {e}")
-        return None
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -335,6 +450,99 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets. Проверьте логи.")
+
+# ---------- АКТИВНОСТЬ ИГРОКОВ (обработчики) ----------
+async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    # Ожидаем отправку скриншота
+    context.user_data['activity_mode'] = True
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    await update.message.reply_text(
+        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность (ГВГ).\n\nДля отмены нажмите «❌ Отмена».",
+        reply_markup=keyboard
+    )
+
+async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('activity_mode'):
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    if not update.message.photo:
+        await update.message.reply_text("Пожалуйста, отправьте фото (скриншот).")
+        return
+    # Скачиваем фото
+    photo_file = await update.message.photo[-1].get_file()
+    image_bytes = await photo_file.download_as_bytearray()
+    await update.message.reply_text("🔍 Распознаю ники на изображении...")
+    nicks = extract_nicks_from_image(bytes(image_bytes))
+    if not nicks:
+        await update.message.reply_text("Не удалось распознать ни одного ника. Попробуйте более чёткое фото.")
+        return
+    # Сохраняем распознанные ники в context.user_data
+    context.user_data['activity_nicks'] = nicks
+    # Получаем список всех активностей (ГВГ) из опросов
+    meetings = get_all_polls_meetings()
+    if not meetings:
+        await update.message.reply_text("Нет созданных опросов (ГВГ). Сначала создайте опрос с встречами.")
+        context.user_data.pop('activity_mode', None)
+        return
+    # Предлагаем выбрать активность кнопками
+    keyboard = []
+    for m in meetings:
+        keyboard.append([KeyboardButton(m)])
+    keyboard.append([KeyboardButton("❌ Отмена")])
+    await update.message.reply_text(
+        f"Распознаны ники: {', '.join(nicks)}\n\nВыберите активность (ГВГ), за которую нужно поставить плюсы:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
+    context.user_data['activity_step'] = 'select_activity'
+
+async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('activity_mode') or context.user_data.get('activity_step') != 'select_activity':
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    activity = update.message.text
+    if activity == "❌ Отмена":
+        context.user_data.pop('activity_mode', None)
+        context.user_data.pop('activity_step', None)
+        context.user_data.pop('activity_nicks', None)
+        await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
+        return
+    nicks = context.user_data.get('activity_nicks', [])
+    if not nicks:
+        await update.message.reply_text("Нет распознанных ников. Попробуйте заново.")
+        context.user_data.pop('activity_mode', None)
+        context.user_data.pop('activity_step', None)
+        return
+    # Подключаемся к Google Sheets
+    spreadsheet = get_google_spreadsheet()
+    if spreadsheet is None:
+        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте настройки.")
+        return
+    ws = get_or_create_activity_sheet(spreadsheet)
+    # Добавляем колонку для активности, если её нет
+    add_activity_column(ws, activity)
+    # Помечаем плюсы
+    updated = mark_activity_for_nicks(ws, activity, nicks)
+    # Проверяем, какие ники не найдены на листе
+    all_nicks_in_sheet = [row[0].strip() for row in ws.get_all_values()[1:] if row]
+    all_nicks_in_sheet_lower = [n.lower() for n in all_nicks_in_sheet]
+    not_found = [nick for nick in nicks if nick.lower() not in all_nicks_in_sheet_lower]
+    await update.message.reply_text(
+        f"✅ Готово!\nАктивность: {activity}\nПоставлено плюсов: {updated}\nРаспознано ников: {len(nicks)}"
+        + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
+        reply_markup=get_main_keyboard(user_id)
+    )
+    # Очищаем состояние
+    context.user_data.pop('activity_mode', None)
+    context.user_data.pop('activity_step', None)
+    context.user_data.pop('activity_nicks', None)
 
 # ---------- РЕДАКТИРОВАНИЕ/УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЯ ----------
 async def edit_class_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,7 +781,7 @@ def get_clan_management_keyboard():
     keyboard = [
         [KeyboardButton("👥 Список пользователей")],
         [KeyboardButton("🗑 Удалить пользователя"), KeyboardButton("✏️ Исправить класс")],
-        [KeyboardButton("🔙 Назад")]
+        [KeyboardButton("📊 Активность игроков"), KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -620,6 +828,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del context.user_data['poll_creation']
             await update.message.reply_text("Создание опроса отменено.", reply_markup=get_admin_keyboard())
             return
+        if context.user_data.get('activity_mode'):
+            context.user_data.pop('activity_mode', None)
+            context.user_data.pop('activity_step', None)
+            context.user_data.pop('activity_nicks', None)
+            await update.message.reply_text("Операция с активностью отменена.", reply_markup=get_main_keyboard(user_id))
+            return
         if context.user_data.get('awaiting_nick') or context.user_data.get('awaiting_class'):
             context.user_data.clear()
             await update.message.reply_text("Регистрация отменена.", reply_markup=get_main_keyboard(user_id))
@@ -633,6 +847,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Удаление пользователя – выбор из списка
     if 'delete_user_list' in context.user_data and text != "🔙 Назад":
         await confirm_delete_user(update, context)
+        return
+
+    # Выбор активности после распознавания
+    if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
+        await handle_activity_choice(update, context)
         return
 
     # Заказ кеша: обработка описания
@@ -732,10 +951,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_user_command(update, context)
     elif text == "✏️ Исправить класс" and is_admin(user_id):
         await edit_class_command(update, context)
+    elif text == "📊 Активность игроков" and is_admin(user_id):
+        await activity_menu(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
-# ---------- СОЗДАНИЕ ОПРОСА (исправленное) ----------
+# ---------- СОЗДАНИЕ ОПРОСА ----------
 async def start_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -796,10 +1017,15 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
 # ---------- ОБРАБОТЧИК ФОТО ----------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # Сначала проверяем, не ожидаем ли мы фото для активности
+    if context.user_data.get('activity_mode') and not context.user_data.get('activity_step'):
+        await handle_activity_photo(update, context)
+        return
+    # Потом – для заказа кеша
     if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'photo':
         await handle_cash_order_photo(update, context)
-    else:
-        await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша».")
+        return
+    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
 
 # ---------- РАССЫЛКА ОПРОСА ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
