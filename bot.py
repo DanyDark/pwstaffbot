@@ -313,18 +313,24 @@ def get_or_create_activity_sheet(spreadsheet):
         ws = spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="100")
+        ws.update_cell(1, 1, "Ник")
         whitelist = load_whitelist()
         nicks_sorted = sorted(whitelist)
-        for i, nick in enumerate(nicks_sorted, start=1):
+        for i, nick in enumerate(nicks_sorted, start=2):
             ws.update_cell(i, 1, nick)
     return ws
 
 def add_activity_column(ws, activity_name):
-    """Добавляет столбец активности, если его нет, и возвращает его индекс (1-базированный)"""
     headers = ws.row_values(1)
-    if activity_name in headers:
-        return headers.index(activity_name) + 1
+    # Ищем среди заголовков, начиная со второго столбца
+    for i, h in enumerate(headers):
+        if i == 0:
+            continue
+        if h.strip() == activity_name:
+            return i + 1
     col_num = len(headers) + 1
+    if col_num == 1:
+        col_num = 2
     ws.update_cell(1, col_num, activity_name)
     return col_num
 
@@ -333,13 +339,14 @@ def mark_activity_for_nicks(ws, activity_name, nicks):
     if not all_values:
         return 0
     headers = all_values[0]
-    # Нормализуем заголовки: убираем пробелы, приводим к нижнему регистру
-    normalized_headers = [h.strip().lower() for h in headers]
-    target = activity_name.strip().lower()
-    try:
-        col_idx = normalized_headers.index(target) + 1
-    except ValueError:
-        # Если столбец не найден, добавляем его
+    col_idx = None
+    for i, h in enumerate(headers):
+        if i == 0:
+            continue
+        if h.strip() == activity_name:
+            col_idx = i + 1
+            break
+    if col_idx is None:
         col_idx = add_activity_column(ws, activity_name)
     updated = 0
     for row_idx, row in enumerate(all_values[1:], start=2):
