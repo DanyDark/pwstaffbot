@@ -2,6 +2,7 @@ import sqlite3
 import logging
 import os
 import json
+import easyocr
 import traceback
 import re
 from datetime import datetime
@@ -10,12 +11,12 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboard
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 # OCR
-import pytesseract
 from PIL import Image
 
 # Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
+reader = easyocr.Reader(['ru', 'en'])
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -316,25 +317,21 @@ def mark_activity_for_nicks(ws, activity_name, nicks):
 
 # ---------- OCR распознавание ников ----------
 def extract_nicks_from_image(image_bytes):
-    """Возвращает список ников, распознанных с картинки (строки)"""
+    """Распознаёт текст на изображении через EasyOCR, возвращает список строк"""
     try:
+        # Конвертируем байты в картинку для EasyOCR
         image = Image.open(BytesIO(image_bytes))
-        # Конвертируем в RGB (на всякий случай)
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        # Распознаём русский+английский
-        text = pytesseract.image_to_string(image, lang='rus+eng', config='--psm 6')
-        # Разбиваем на строки, убираем лишние пробелы
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        # Дополнительная фильтрация: убираем слишком короткие строки (меньше 2 символов) и числа
+        # EasyOCR работает напрямую с PIL Image
+        result = reader.readtext(image, detail=0, paragraph=False)
+        # result – это список распознанных строк
         nicks = []
-        for line in lines:
-            # Проверяем, что строка не состоит только из цифр
+        for line in result:
+            line = line.strip()
             if len(line) >= 2 and not line.isdigit():
                 nicks.append(line)
         return nicks
     except Exception as e:
-        logging.error(f"OCR ошибка: {e}")
+        logging.error(f"Ошибка распознавания EasyOCR: {e}")
         return []
 
 # ---------- КЕШ-ЗАЯВКИ ----------
