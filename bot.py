@@ -6,7 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # ------------------ НАСТРОЙКИ ------------------
 BOT_TOKEN = '8909227571:AAHRgxTIK1QIiJpCX-QuG2u8jB0mLqtFMAc'   # ВСТАВЬ СЮДА ТОКЕН!
 WHITELIST_FILE = "whitelist.txt"
-DB_FILE = "users.db"
+DB_FILE = "/data/users.db"
 # ----------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
