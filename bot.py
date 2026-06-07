@@ -14,6 +14,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 import gspread
 from google.oauth2.service_account import Credentials
 
+# Нечёткое сравнение строк
+from rapidfuzz import fuzz
+
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -270,7 +273,25 @@ def extract_nicks_from_image(image_bytes):
         logging.error(f"Ошибка OCR.space: {e}")
         return []
 
-# ---------- GOOGLE SHEETS ----------
+# ---------- НЕЧЁТКОЕ СРАВНЕНИЕ ----------
+def fuzzy_match_nicks(recognized_nicks, known_nicks, threshold=85):
+    matched = {}
+    unmatched = []
+    for rn in recognized_nicks:
+        best_match = None
+        best_ratio = 0
+        for kn in known_nicks:
+            ratio = fuzz.ratio(rn.lower(), kn.lower())
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = kn
+        if best_ratio >= threshold:
+            matched[rn] = best_match
+        else:
+            unmatched.append(rn)
+    return matched, unmatched
+
+# ---------- GOOGLE SHEETS (Активность игроков) ----------
 def get_google_spreadsheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -299,6 +320,7 @@ def get_or_create_activity_sheet(spreadsheet):
     return ws
 
 def add_activity_column(ws, activity_name):
+    """Добавляет столбец активности, если его нет, и возвращает его индекс (1-базированный)"""
     headers = ws.row_values(1)
     if activity_name in headers:
         return headers.index(activity_name) + 1
@@ -307,6 +329,7 @@ def add_activity_column(ws, activity_name):
     return col_num
 
 def mark_activity_for_nicks(ws, activity_name, nicks):
+    """Ставит '+' в столбце activity_name для найденных ников (по первому столбцу)"""
     all_values = ws.get_all_values()
     if not all_values:
         return 0
@@ -612,11 +635,35 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     photo_file = await update.message.photo[-1].get_file()
     image_bytes = await photo_file.download_as_bytearray()
     await update.message.reply_text("🔍 Распознаю ники на изображении...")
-    nicks = extract_nicks_from_image(bytes(image_bytes))
-    if not nicks:
-        await update.message.reply_text("Не удалось распознать ни одного ника. Попробуйте более чёткое фото.")
+    raw_nicks = extract_nicks_from_image(bytes(image_bytes))
+    if not raw_nicks:
+        await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
-    context.user_data['activity_nicks'] = nicks
+
+    # Загружаем белый список
+    whitelist = load_whitelist()
+    known_nicks = list(whitelist)
+
+    # Нечёткое сравнение
+    matched, unmatched = fuzzy_match_nicks(raw_nicks, known_nicks, threshold=85)
+
+    # Итоговый список для простановки плюсов
+    final_nicks = list(matched.values()) + unmatched
+
+    context.user_data['activity_nicks'] = final_nicks
+    context.user_data['activity_raw'] = raw_nicks
+    context.user_data['activity_matched'] = matched
+
+    if not final_nicks:
+        await update.message.reply_text("Не удалось распознать ни одного ника после сопоставления.")
+        return
+
+    stats = f"✅ Распознано: {len(raw_nicks)} ников.\n" \
+            f"🎯 Совпало с белым списком: {len(matched)}.\n" \
+            f"❓ Не распознано (будут записаны как есть): {len(unmatched)}.\n\n"
+    if unmatched:
+        stats += f"Неопознанные: {', '.join(unmatched)}\n\n"
+
     meetings = get_all_polls_meetings()
     if not meetings:
         await update.message.reply_text("Нет созданных опросов (ГВГ). Сначала создайте опрос с встречами.")
@@ -627,7 +674,7 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard.append([KeyboardButton(m)])
     keyboard.append([KeyboardButton("❌ Отмена")])
     await update.message.reply_text(
-        f"Распознаны ники: {', '.join(nicks)}\n\nВыберите активность (ГВГ), за которую нужно поставить плюсы:",
+        stats + f"Список для записи: {', '.join(final_nicks)}\n\nВыберите активность (ГВГ):",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
     context.user_data['activity_step'] = 'select_activity'
@@ -656,7 +703,6 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте настройки.")
         return
     ws = get_or_create_activity_sheet(spreadsheet)
-    col_idx = add_activity_column(ws, activity)
     updated = mark_activity_for_nicks(ws, activity, nicks)
     all_nicks_in_sheet = [row[0].strip() for row in ws.get_all_values()[1:] if row]
     all_nicks_in_sheet_lower = [n.lower() for n in all_nicks_in_sheet]
