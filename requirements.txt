@@ -1,7 +1,5 @@
 python-telegram-bot
 gspread
 google-auth
-easyocr
-torch
-torchvision
+requests
 Pillow
