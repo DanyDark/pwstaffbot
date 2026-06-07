@@ -2,9 +2,15 @@ import sqlite3
 import logging
 import os
 import json
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
+# Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Не задана переменная окружения BOT_TOKEN")
@@ -15,6 +21,11 @@ ADMIN_LIST = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip()]
 WHITELIST_FILE = "whitelist.txt"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_FILE = os.path.join(DATA_DIR, "users.db")
+
+# Google Sheets
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+# =============================================
 
 logging.basicConfig(level=logging.INFO)
 
@@ -114,11 +125,11 @@ def create_poll(text, meetings):
 def get_active_poll():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT poll_id, text, meetings_json FROM polls WHERE is_active = 1")
+    cursor.execute("SELECT poll_id, text, meetings_json, created_at FROM polls WHERE is_active = 1")
     row = cursor.fetchone()
     conn.close()
     if row:
-        return {"id": row[0], "text": row[1], "meetings": json.loads(row[2])}
+        return {"id": row[0], "text": row[1], "meetings": json.loads(row[2]), "created_at": row[3]}
     return None
 
 def deactivate_poll():
@@ -156,6 +167,54 @@ def get_response_summary(poll_id, meetings):
         if meeting in summary:
             summary[meeting][nick] = answer
     return summary
+
+# ---------- GOOGLE SHEETS ----------
+def get_google_sheet():
+    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        logging.error("Переменные окружения для Google Sheets не заданы")
+        return None
+    try:
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        return sheet
+    except Exception as e:
+        logging.error(f"Ошибка подключения к Google Sheets: {e}")
+        return None
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    poll = get_active_poll()
+    if not poll:
+        await update.message.reply_text("Нет активного опроса для экспорта.")
+        return
+    sheet = get_google_sheet()
+    if sheet is None:
+        await update.message.reply_text("Не удалось подключиться к Google Sheets. Проверьте переменные GOOGLE_CREDS и GOOGLE_SHEET_ID.")
+        return
+    summary = get_response_summary(poll['id'], poll['meetings'])
+    # Формируем данные: заголовки + строки
+    headers = ["Название опроса", "Текст опроса", "Встреча", "Ник", "Ответ"]
+    data = [headers]
+    for meeting in poll['meetings']:
+        responses = summary.get(meeting, {})
+        if responses:
+            for nick, answer in responses.items():
+                data.append([f"Опрос {poll['id']}", poll['text'], meeting, nick, answer])
+        else:
+            data.append([f"Опрос {poll['id']}", poll['text'], meeting, "Нет ответов", "-"])
+    try:
+        sheet.clear()
+        sheet.update(values=data, range_name='A1')
+        await update.message.reply_text("✅ Результаты опроса успешно выгружены в Google Таблицу!")
+    except Exception as e:
+        logging.error(f"Ошибка записи: {e}")
+        await update.message.reply_text("Произошла ошибка при записи в Google Sheets.")
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
@@ -290,7 +349,7 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
     await query.edit_message_text(f"✅ Опрос создан!\n\nТекст: {data['text']}\nВстречи: {', '.join(data['meetings'])}")
     del context.user_data['poll_creation']
 
-# ---------- РАССЫЛКА ОПРОСА (без глобального хранилища) ----------
+# ---------- РАССЫЛКА ОПРОСА (последовательная, без глобального хранилища) ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -309,7 +368,6 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = 0
     for uid, nick, _ in users:
         try:
-            # Отправляем первый вопрос с индексом 0
             await send_first_question(uid, poll, context)
             success += 1
         except Exception as e:
@@ -317,7 +375,6 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Рассылка инициирована. Первый вопрос отправлен {success} из {len(users)} пользователям.")
 
 async def send_first_question(chat_id: int, poll: dict, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет первый вопрос опроса, передавая индекс следующего вопроса через callback_data"""
     meetings = poll['meetings']
     if not meetings:
         return
@@ -340,34 +397,41 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    # Формат: poll_{poll_id}_{meeting}_{answer}_{next_index}
     parts = data.split('_')
     if len(parts) < 5 or parts[0] != 'poll':
         await query.edit_message_text("Ошибка: некорректные данные.")
         return
     poll_id = int(parts[1])
-    meeting = '_'.join(parts[2:-2])  # на случай, если в названии встречи есть _
-    answer = parts[-2]
-    next_index = int(parts[-1])
-
+    # meeting может содержать подчёркивания, поэтому собираем всё между poll_id и answer
+    answer_idx = -2
+    next_idx_str = parts[-1]
+    # Ищем, где начинается answer: один из "да","нет","не знаю"
+    answer_str = None
+    for i, p in enumerate(parts):
+        if p in ('да', 'нет', 'не знаю'):
+            answer_str = p
+            answer_idx = i
+            break
+    if answer_str is None:
+        await query.edit_message_text("Ошибка: не распознан ответ.")
+        return
+    meeting = '_'.join(parts[2:answer_idx])  # всё, что между poll_id и ответом
+    next_index = int(next_idx_str)
     user_id = query.from_user.id
     if not is_registered(user_id):
         await query.edit_message_text("Вы не зарегистрированы. Напишите /start")
         return
 
-    # Получаем активный опрос для проверки
     poll = get_active_poll()
     if not poll or poll['id'] != poll_id:
         await query.edit_message_text("Этот опрос уже не активен.")
         return
 
     meetings = poll['meetings']
-    # Сохраняем ответ во временное хранилище пользователя
     if 'poll_answers' not in context.user_data:
         context.user_data['poll_answers'] = {}
-    context.user_data['poll_answers'][meeting] = answer
+    context.user_data['poll_answers'][meeting] = answer_str
 
-    # Если это был последний вопрос
     if next_index >= len(meetings):
         # Показать сводку
         summary_text = "✅ *Ваши ответы:*\n\n"
@@ -382,7 +446,6 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(summary_text, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # Иначе отправляем следующий вопрос
     next_meeting = meetings[next_index]
     keyboard = InlineKeyboardMarkup([
         [
@@ -400,7 +463,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data  # confirm_{poll_id}
+    data = query.data
     poll_id = int(data.split('_')[1])
     user_id = query.from_user.id
     answers = context.user_data.get('poll_answers', {})
@@ -408,19 +471,16 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Нет данных для сохранения.")
         return
     save_responses(user_id, poll_id, answers)
-    # Очищаем временные данные
-    context.user_data['poll_answers'] = {}
+    del context.user_data['poll_answers']
     await query.edit_message_text("✅ Спасибо! Ваши ответы сохранены. Опрос завершён.")
 
 async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data  # restart_{poll_id}
+    data = query.data
     poll_id = int(data.split('_')[1])
     user_id = query.from_user.id
-    # Очищаем временные ответы
     context.user_data['poll_answers'] = {}
-    # Начинаем заново с первого вопроса
     poll = get_active_poll()
     if not poll or poll['id'] != poll_id:
         await query.edit_message_text("Опрос более не активен.")
@@ -442,7 +502,7 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-# ---------- РЕЗУЛЬТАТЫ ----------
+# ---------- РЕЗУЛЬТАТЫ (текстовые) ----------
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -525,6 +585,7 @@ def main():
     app.add_handler(CommandHandler("count", count_command))
     app.add_handler(CommandHandler("send_poll", send_poll_to_all))
     app.add_handler(CommandHandler("results", show_results))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
@@ -540,4 +601,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
