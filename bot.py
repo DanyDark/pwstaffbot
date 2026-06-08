@@ -537,14 +537,13 @@ async def handle_cash_order_description(update: Update, context: ContextTypes.DE
 
 async def leave_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_LIST:
-        await update.message.reply_text("У вас нет прав на эту команду.")
+        await update.message.reply_text("У вас нет прав.")
         return
     chat_id = update.effective_chat.id
-    try:
-        await context.bot.leave_chat(chat_id)
-        await update.message.reply_text("Бот покинул чат.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка при выходе: {e}")
+    # Отправляем сообщение, которое скроет клавиатуру у всех, кто его увидит
+    await context.bot.send_message(chat_id, "Клавиатура скрыта.", reply_markup=ReplyKeyboardRemove())
+    # Затем выходим
+    await context.bot.leave_chat(chat_id)
 
 async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
