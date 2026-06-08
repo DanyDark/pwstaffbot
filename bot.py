@@ -9,6 +9,7 @@ from datetime import datetime
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import ReplyKeyboardRemove
 
 # Google Sheets
 import gspread
@@ -290,6 +291,48 @@ def fuzzy_match_nicks(recognized_nicks, known_nicks, threshold=85):
         else:
             unmatched.append(rn)
     return matched, unmatched
+
+async def remove_all_keyboards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для массового удаления клавиатур у всех пользователей."""
+    # Проверка прав администратора
+    if update.effective_user.id not in ADMIN_LIST:
+        await update.message.reply_text("У вас нет прав на эту команду.")
+        return
+
+    # Уведомление о начале процесса
+    report_msg = await update.message.reply_text("🚀 Начинаю удаление клавиатур у всех пользователей...")
+
+    # Получаем всех пользователей из базы данных
+    users = get_all_users()
+    if not users:
+        await report_msg.edit_text("В базе данных нет пользователей.")
+        return
+
+    # Счётчики для отчёта
+    success = 0
+    failed = 0
+
+    # Отправляем сообщение с пустой клавиатурой каждому пользователю
+    for user_id, nick, _, _ in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🔄 Интерфейс бота обновлён. Ваша клавиатура скрыта.",
+                reply_markup=ReplyKeyboardRemove()  # Это и есть магия
+            )
+            success += 1
+        except Exception as e:
+            logging.error(f"Не удалось удалить клавиатуру у {nick} (ID: {user_id}): {e}")
+            failed += 1
+
+    # Финальный отчёт
+    await report_msg.edit_text(
+        f"✅ **Отчёт об удалении клавиатур**\n"
+        f"▸ Успешно: {success}\n"
+        f"▸ С ошибками: {failed}\n"
+        f"▸ Всего: {success + failed}",
+        parse_mode="Markdown"
+    )
 
 # ---------- GOOGLE SHEETS (Активность игроков) ----------
 def get_google_spreadsheet():
@@ -1192,6 +1235,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
     app.add_handler(CommandHandler("leave", leave_chat))
+    app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
 
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
