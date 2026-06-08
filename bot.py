@@ -1191,6 +1191,7 @@ def main():
     app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
+    app.add_handler(CommandHandler("leave", leave_chat))
 
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
