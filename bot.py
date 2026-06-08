@@ -492,6 +492,17 @@ async def handle_cash_order_description(update: Update, context: ContextTypes.DE
         except Exception as e:
             logging.error(f"Не удалось уведомить админа {admin_id}: {e}")
 
+async def leave_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_LIST:
+        await update.message.reply_text("У вас нет прав на эту команду.")
+        return
+    chat_id = update.effective_chat.id
+    try:
+        await context.bot.leave_chat(chat_id)
+        await update.message.reply_text("Бот покинул чат.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при выходе: {e}")
+
 async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
