@@ -26,7 +26,6 @@ if not BOT_TOKEN:
 ADMIN_IDS = os.environ.get("ADMIN_IDS", "")
 ADMIN_LIST = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip()]
 
-WHITELIST_FILE = "whitelist.txt"
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_FILE = os.path.join(DATA_DIR, "users.db")
 
@@ -88,24 +87,16 @@ def init_db():
             reviewed_at TIMESTAMP
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_users (
+            user_id INTEGER PRIMARY KEY,
+            nick TEXT NOT NULL,
+            class TEXT NOT NULL,
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
-
-# ---------- БЕЛЫЙ СПИСОК ----------
-def load_whitelist():
-    whitelist = set()
-    try:
-        with open(WHITELIST_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                nick = line.strip()
-                if nick:
-                    whitelist.add(nick.lower())
-    except FileNotFoundError:
-        logging.error(f"Файл {WHITELIST_FILE} не найден!")
-    return whitelist
-
-def is_nick_in_whitelist(nick):
-    return nick.lower() in load_whitelist()
 
 # ---------- ПОЛЬЗОВАТЕЛИ ----------
 def is_registered(user_id):
@@ -141,9 +132,14 @@ def get_user_id_by_nick(nick):
     return row[0] if row else None
 
 def is_nick_taken(nick):
+    """Проверяет, занят ли ник в users или pending_users"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM users WHERE nick = ?", (nick,))
+    if cursor.fetchone():
+        conn.close()
+        return True
+    cursor.execute("SELECT 1 FROM pending_users WHERE nick = ?", (nick,))
     result = cursor.fetchone()
     conn.close()
     return result is not None
@@ -183,15 +179,51 @@ def is_admin(user_id):
     return user_id in ADMIN_LIST
 
 def is_user_valid(user_id):
-    if not is_registered(user_id):
-        return False
-    nick = get_user_nick(user_id)
-    if not nick:
-        return False
-    if not is_nick_in_whitelist(nick):
-        delete_user(user_id)
-        return False
-    return True
+    """Пользователь считается валидным, если он есть в таблице users"""
+    return is_registered(user_id)
+
+# ---------- ЗАЯВКИ НА РЕГИСТРАЦИЮ ----------
+def add_pending_user(user_id, nick, user_class):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO pending_users (user_id, nick, class)
+        VALUES (?, ?, ?)
+    ''', (user_id, nick, user_class))
+    conn.commit()
+    conn.close()
+
+def get_pending_users():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, nick, class, requested_at FROM pending_users ORDER BY requested_at")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def confirm_all_pending():
+    """Переносит всех ожидающих в таблицу users, очищает pending, возвращает количество"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, nick, class FROM pending_users")
+    pending = cursor.fetchall()
+    for user_id, nick, user_class in pending:
+        cursor.execute('''
+            INSERT OR REPLACE INTO users (user_id, nick, class)
+            VALUES (?, ?, ?)
+        ''', (user_id, nick, user_class))
+    cursor.execute("DELETE FROM pending_users")
+    conn.commit()
+    conn.close()
+    return len(pending)
+
+def is_pending(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM pending_users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
 
 # ---------- ОПРОСЫ ----------
 def create_poll(text, meetings):
@@ -294,38 +326,27 @@ def fuzzy_match_nicks(recognized_nicks, known_nicks, threshold=85):
 
 async def remove_all_keyboards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для массового удаления клавиатур у всех пользователей."""
-    # Проверка прав администратора
     if update.effective_user.id not in ADMIN_LIST:
         await update.message.reply_text("У вас нет прав на эту команду.")
         return
-
-    # Уведомление о начале процесса
     report_msg = await update.message.reply_text("🚀 Начинаю удаление клавиатур у всех пользователей...")
-
-    # Получаем всех пользователей из базы данных
     users = get_all_users()
     if not users:
         await report_msg.edit_text("В базе данных нет пользователей.")
         return
-
-    # Счётчики для отчёта
     success = 0
     failed = 0
-
-    # Отправляем сообщение с пустой клавиатурой каждому пользователю
     for user_id, nick, _, _ in users:
         try:
             await context.bot.send_message(
                 chat_id=user_id,
                 text="🔄 Интерфейс бота обновлён. Ваша клавиатура скрыта.",
-                reply_markup=ReplyKeyboardRemove()  # Это и есть магия
+                reply_markup=ReplyKeyboardRemove()
             )
             success += 1
         except Exception as e:
             logging.error(f"Не удалось удалить клавиатуру у {nick} (ID: {user_id}): {e}")
             failed += 1
-
-    # Финальный отчёт
     await report_msg.edit_text(
         f"✅ **Отчёт об удалении клавиатур**\n"
         f"▸ Успешно: {success}\n"
@@ -357,15 +378,10 @@ def get_or_create_activity_sheet(spreadsheet):
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="100")
         ws.update_cell(1, 1, "Ник")
-        whitelist = load_whitelist()
-        nicks_sorted = sorted(whitelist)
-        for i, nick in enumerate(nicks_sorted, start=2):
-            ws.update_cell(i, 1, nick)
     return ws
 
 def add_activity_column(ws, activity_name):
     headers = ws.row_values(1)
-    # Ищем среди заголовков, начиная со второго столбца
     for i, h in enumerate(headers):
         if i == 0:
             continue
@@ -540,9 +556,7 @@ async def leave_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У вас нет прав.")
         return
     chat_id = update.effective_chat.id
-    # Отправляем сообщение, которое скроет клавиатуру у всех, кто его увидит
     await context.bot.send_message(chat_id, "Клавиатура скрыта.", reply_markup=ReplyKeyboardRemove())
-    # Затем выходим
     await context.bot.leave_chat(chat_id)
 
 async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,21 +672,6 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
 
-# ---------- СИНХРОНИЗАЦИЯ БЕЛОГО СПИСКА ----------
-async def sync_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    whitelist = load_whitelist()
-    users = get_all_users()
-    deleted = 0
-    for uid, nick, _, _ in users:
-        if nick.lower() not in whitelist:
-            delete_user(uid)
-            deleted += 1
-    await update.message.reply_text(f"Синхронизация завершена. Удалено пользователей: {deleted}")
-
 # ---------- АКТИВНОСТЬ ИГРОКОВ ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -703,14 +702,11 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
 
-    # Загружаем белый список
-    whitelist = load_whitelist()
-    known_nicks = list(whitelist)
+    # Получаем все ники из зарегистрированных пользователей
+    users = get_all_users()
+    known_nicks = [nick for _, nick, _, _ in users]
 
-    # Нечёткое сравнение
     matched, unmatched = fuzzy_match_nicks(raw_nicks, known_nicks, threshold=85)
-
-    # Итоговый список для простановки плюсов
     final_nicks = list(matched.values()) + unmatched
 
     context.user_data['activity_nicks'] = final_nicks
@@ -722,7 +718,7 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     stats = f"✅ Распознано: {len(raw_nicks)} ников.\n" \
-            f"🎯 Совпало с белым списком: {len(matched)}.\n" \
+            f"🎯 Совпало с зарегистрированными: {len(matched)}.\n" \
             f"❓ Не распознано (будут записаны как есть): {len(unmatched)}.\n\n"
     if unmatched:
         stats += f"Неопознанные: {', '.join(unmatched)}\n\n"
@@ -779,6 +775,63 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.pop('activity_step', None)
     context.user_data.pop('activity_nicks', None)
 
+# ---------- УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ (АДМИН) ----------
+async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    keyboard = [
+        [KeyboardButton("📋 Список ожидания")],
+        [KeyboardButton("✅ Подтвердить всех")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    await update.message.reply_text("Управление регистрацией:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+
+async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    pending = get_pending_users()
+    if not pending:
+        await update.message.reply_text("Нет ожидающих регистрации.")
+        return
+    msg = "📝 *Список ожидающих регистрации:*\n\n"
+    for uid, nick, user_class, req_date in pending:
+        msg += f"• {nick} (класс: {user_class}) – ID: `{uid}` – заявка от {req_date}\n"
+        if len(msg) > 3800:
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            msg = ""
+    if msg:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    count = confirm_all_pending()
+    # Добавляем подтверждённых ников в Google Таблицу (лист Активность игроков)
+    spreadsheet = get_google_spreadsheet()
+    if spreadsheet:
+        ws = get_or_create_activity_sheet(spreadsheet)
+        # Получаем текущие ники из первого столбца
+        current_nicks = ws.col_values(1)[1:]  # пропускаем заголовок
+        current_nicks_lower = [n.strip().lower() for n in current_nicks if n.strip()]
+        added = 0
+        # Все только что подтверждённые пользователи уже в users, получаем их
+        users = get_all_users()
+        for uid, nick, _, _ in users:
+            if nick.lower() not in current_nicks_lower:
+                # Добавляем в конец
+                row_num = len(current_nicks) + 2 + added
+                ws.update_cell(row_num, 1, nick)
+                added += 1
+        if added:
+            logging.info(f"Добавлено {added} новых ников в лист активности")
+    await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
+
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [[KeyboardButton("👤 Мой профиль"), KeyboardButton("❓ Помощь")]]
@@ -800,7 +853,7 @@ def get_clan_management_keyboard():
     keyboard = [
         [KeyboardButton("👥 Список пользователей")],
         [KeyboardButton("✏️ Исправить класс"), KeyboardButton("📊 Активность игроков")],
-        [KeyboardButton("🔄 Синхронизировать"), KeyboardButton("🔙 Назад")]
+        [KeyboardButton("📝 Регистрация"), KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -816,12 +869,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
         await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
+    elif is_pending(user_id):
+        await update.message.reply_text("Ваша заявка на регистрацию уже отправлена администратору. Пожалуйста, ожидайте подтверждения.")
     else:
         await update.message.reply_text(
             "⚠️ *Внимание!*\n"
-            "Бот будет использовать ваш игровой ник (из списка) и ваш Telegram ID для идентификации.\n"
+            "Бот будет использовать ваш игровой ник и ваш Telegram ID для идентификации.\n"
             "Никакие другие персональные данные не собираются.\n\n"
-            "Для продолжения регистрации введите свой игровой ник из списка.",
+            "Для регистрации введите свой игровой ник.",
             parse_mode="Markdown"
         )
         context.user_data['awaiting_nick'] = True
@@ -875,11 +930,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Регистрация: ник
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
-        if not is_nick_in_whitelist(nick):
-            await update.message.reply_text("Ник не найден в белом списке. Попробуйте ещё раз.")
-            return
         if is_nick_taken(nick):
-            await update.message.reply_text("❌ Этот ник уже зарегистрирован другим пользователем. Введите другой ник.")
+            await update.message.reply_text("❌ Этот ник уже зарегистрирован или ожидает подтверждения. Введите другой ник.")
             return
         context.user_data['temp_nick'] = nick
         context.user_data['awaiting_nick'] = False
@@ -887,15 +939,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Отлично! Теперь выберите класс вашего персонажа:", reply_markup=get_class_keyboard())
         return
 
-    # Регистрация: класс
+    # Регистрация: класс (отправляем заявку)
     if context.user_data.get('awaiting_class'):
         valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         if text in valid_classes:
             nick = context.user_data.pop('temp_nick')
             user_class = text
-            register_user(user_id, nick, user_class)
+            add_pending_user(user_id, nick, user_class)
             context.user_data.pop('awaiting_class', None)
-            await update.message.reply_text(f"Регистрация завершена!\nНик: {nick}\nКласс: {user_class}", reply_markup=get_main_keyboard(user_id))
+            await update.message.reply_text(
+                f"✅ Заявка на регистрацию отправлена!\nНик: {nick}\nКласс: {user_class}\n\n"
+                "Дождитесь подтверждения администратора.",
+                reply_markup=get_main_keyboard(user_id)
+            )
+            for admin_id in ADMIN_LIST:
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        f"📝 Новая заявка на регистрацию!\nНик: {nick}\nКласс: {user_class}\nID: {user_id}"
+                    )
+                except Exception as e:
+                    logging.error(f"Не удалось уведомить админа {admin_id}: {e}")
         else:
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
@@ -903,8 +967,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка валидности
     if not is_user_valid(user_id):
         await update.message.reply_text(
-            "❌ Ваш ник был удалён из списка доступа. Обратитесь к администратору.\n"
-            "Для повторной регистрации нажмите /start."
+            "❌ Вы не зарегистрированы. Нажмите /start для регистрации."
         )
         return
 
@@ -958,8 +1021,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_class_command(update, context)
     elif text == "📊 Активность игроков" and is_admin(user_id):
         await activity_menu(update, context)
-    elif text == "🔄 Синхронизировать" and is_admin(user_id):
-        await sync_whitelist_command(update, context)
+    elif text == "📝 Регистрация" and is_admin(user_id):
+        await registration_menu(update, context)
+    elif text == "📋 Список ожидания" and is_admin(user_id):
+        await list_pending_command(update, context)
+    elif text == "✅ Подтвердить всех" and is_admin(user_id):
+        await confirm_all_pending_command(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
@@ -1030,7 +1097,7 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = 0
     for uid, nick, _, _ in users:
         if not is_user_valid(uid):
-            logging.info(f"Пользователь {uid} ({nick}) пропущен: ник не в белом списке")
+            logging.info(f"Пользователь {uid} ({nick}) пропущен: не зарегистрирован")
             continue
         try:
             await send_first_question(uid, poll, context)
@@ -1064,7 +1131,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
     if not is_user_valid(user_id):
-        await query.edit_message_text("❌ Ваш ник был удалён. Обратитесь к администратору.\nДля повторной регистрации нажмите /start.")
+        await query.edit_message_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return
     parts = data.split('_')
     if len(parts) < 5 or parts[0] != 'poll':
@@ -1121,7 +1188,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     if not is_user_valid(user_id):
-        await query.edit_message_text("❌ Ваш ник удалён. Нажмите /start.")
+        await query.edit_message_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return
     data = query.data
     poll_id = int(data.split('_')[1])
@@ -1138,7 +1205,7 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     if not is_user_valid(user_id):
-        await query.edit_message_text("❌ Ваш ник удалён. Нажмите /start.")
+        await query.edit_message_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return
     data = query.data
     poll_id = int(data.split('_')[1])
@@ -1168,7 +1235,7 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_valid(user_id):
-        await update.message.reply_text("❌ Ваш ник удалён. Нажмите /start.")
+        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
         return
     await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
 
@@ -1208,7 +1275,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'photo':
         await handle_cash_order_photo(update, context)
         return
-    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
+    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеща». Для активности используйте пункт «📊 Активность игроков».")
 
 # ---------- ЗАПУСК ----------
 def main():
@@ -1222,7 +1289,6 @@ def main():
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CommandHandler("sync_whitelist", sync_whitelist_command))
     app.add_handler(CommandHandler("edit_class", edit_class_command))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
