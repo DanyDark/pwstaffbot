@@ -1059,43 +1059,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Основное меню
-    # ... в функции handle_text, после проверки is_user_valid
-
-if text == "👤 Мой профиль":
-    nick = get_user_nick(user_id)
-    user_class = get_user_class(user_id)
-    await update.message.reply_text(
-        f"👤 *Ваш профиль*\n\nНик: {nick}\nКласс: {user_class}",
-        parse_mode="Markdown"
-    )
-elif text == "📊 Моя активность":
-    nick = get_user_nick(user_id)
-    if not nick:
-        await update.message.reply_text("Не удалось определить ник.")
-        return
-    activity_count = get_user_activity_count(nick)
-    await update.message.reply_text(
-        f"📊 *Ваша активность*\n\nВсего отметок «БЫЛ» в таблице: {activity_count}",
-        parse_mode="Markdown"
-    )
-elif text == "📝 Мои ответы":
-    answers = get_user_current_poll_answers(user_id)
-    if answers is None:
-        await update.message.reply_text("Нет активного опроса.")
-    elif not answers:
-        await update.message.reply_text("Вы ещё не ответили на текущий опрос.")
-    else:
-        msg = "📝 *Ваши ответы на текущий опрос:*\n\n"
-        for meeting, ans in answers.items():
-            msg += f"• {meeting}: {ans}\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-elif text == "❓ Помощь":
-    await update.message.reply_text(
-        "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
-    )
-elif text == "💰 Заказ кеша":
-    await cash_order_start(update, context)
-# ... остальные обработчики (админ-панель и т.д.)
+    # Основное меню
+    if text == "👤 Мой профиль":
+        nick = get_user_nick(user_id)
+        user_class = get_user_class(user_id)
+        await update.message.reply_text(
+            f"👤 *Ваш профиль*\n\nНик: {nick}\nКласс: {user_class}",
+            parse_mode="Markdown"
+        )
+    elif text == "📊 Моя активность":
+        nick = get_user_nick(user_id)
+        if not nick:
+            await update.message.reply_text("Не удалось определить ник.")
+            return
+        activity_count = get_user_activity_count(nick)
+        await update.message.reply_text(
+            f"📊 *Ваша активность*\n\nВсего отметок «БЫЛ» в таблице: {activity_count}",
+            parse_mode="Markdown"
+        )
+    elif text == "📝 Мои ответы":
+        answers = get_user_current_poll_answers(user_id)
+        if answers is None:
+            await update.message.reply_text("Нет активного опроса.")
+        elif not answers:
+            await update.message.reply_text("Вы ещё не ответили на текущий опрос.")
+        else:
+            msg = "📝 *Ваши ответы на текущий опрос:*\n\n"
+            for meeting, ans in answers.items():
+                msg += f"• {meeting}: {ans}\n"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+    elif text == "❓ Помощь":
+        await update.message.reply_text(
+            "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
+        )
+    elif text == "💰 Заказ кеша":
+        await cash_order_start(update, context)
     elif text == "📊 Админ-панель" and is_admin(user_id):
         await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
     elif text == "🔙 Назад" and is_admin(user_id):
