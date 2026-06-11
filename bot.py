@@ -910,10 +910,13 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
     
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
-    keyboard = [[KeyboardButton("👤 Мой профиль"), KeyboardButton("❓ Помощь")]]
+    keyboard = [
+        [KeyboardButton("👤 Мой профиль")],
+        [KeyboardButton("📊 Моя активность"), KeyboardButton("📝 Мои ответы")],
+        [KeyboardButton("❓ Помощь"), KeyboardButton("💰 Заказ кеша")]
+    ]
     if is_admin(user_id):
         keyboard.append([KeyboardButton("📊 Админ-панель")])
-    keyboard.append([KeyboardButton("💰 Заказ кеша")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_admin_keyboard():
@@ -1056,21 +1059,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Основное меню
-    if text == "👤 Мой профиль":
-        nick = get_user_nick(user_id)
-        user_class = get_user_class(user_id)
-        # Отправляем сообщение с информацией и inline-клавиатурой
-        await update.message.reply_text(
-            f"👤 *Ваш профиль*\n\nНик: {nick}\nКласс: {user_class}",
-            parse_mode="Markdown",
-            reply_markup=get_profile_keyboard()
-        )
-    elif text == "❓ Помощь":
-        await update.message.reply_text(
-            "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
-        )
-    elif text == "💰 Заказ кеша":
-        await cash_order_start(update, context)
+    # ... в функции handle_text, после проверки is_user_valid
+
+if text == "👤 Мой профиль":
+    nick = get_user_nick(user_id)
+    user_class = get_user_class(user_id)
+    await update.message.reply_text(
+        f"👤 *Ваш профиль*\n\nНик: {nick}\nКласс: {user_class}",
+        parse_mode="Markdown"
+    )
+elif text == "📊 Моя активность":
+    nick = get_user_nick(user_id)
+    if not nick:
+        await update.message.reply_text("Не удалось определить ник.")
+        return
+    activity_count = get_user_activity_count(nick)
+    await update.message.reply_text(
+        f"📊 *Ваша активность*\n\nВсего отметок «БЫЛ» в таблице: {activity_count}",
+        parse_mode="Markdown"
+    )
+elif text == "📝 Мои ответы":
+    answers = get_user_current_poll_answers(user_id)
+    if answers is None:
+        await update.message.reply_text("Нет активного опроса.")
+    elif not answers:
+        await update.message.reply_text("Вы ещё не ответили на текущий опрос.")
+    else:
+        msg = "📝 *Ваши ответы на текущий опрос:*\n\n"
+        for meeting, ans in answers.items():
+            msg += f"• {meeting}: {ans}\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+elif text == "❓ Помощь":
+    await update.message.reply_text(
+        "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
+    )
+elif text == "💰 Заказ кеша":
+    await cash_order_start(update, context)
+# ... остальные обработчики (админ-панель и т.д.)
     elif text == "📊 Админ-панель" and is_admin(user_id):
         await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
     elif text == "🔙 Назад" and is_admin(user_id):
@@ -1120,44 +1145,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await confirm_all_pending_command(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
-
-async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == "profile_activity":
-        nick = get_user_nick(user_id)
-        if not nick:
-            await query.edit_message_text("Не удалось определить ник.")
-            return
-        activity_count = get_user_activity_count(nick)
-        await query.edit_message_text(
-            f"📊 *Ваша активность*\n\nВсего отметок «БЫЛ» в таблице активности: {activity_count}",
-            parse_mode="Markdown",
-            reply_markup=get_profile_keyboard()
-        )
-    elif data == "profile_poll_answers":
-        answers = get_user_current_poll_answers(user_id)
-        if answers is None:
-            await query.edit_message_text("Нет активного опроса.", reply_markup=get_profile_keyboard())
-        elif not answers:
-            await query.edit_message_text("Вы ещё не ответили на текущий опрос.", reply_markup=get_profile_keyboard())
-        else:
-            text = "📝 *Ваши ответы на текущий опрос:*\n\n"
-            for meeting, ans in answers.items():
-                text += f"• {meeting}: {ans}\n"
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_profile_keyboard())
-    elif data == "profile_back":
-        # Возвращаем в главное меню
-        await query.edit_message_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
-        # Удаляем сообщение с клавиатурой? Просто оставляем, можно отправить новое
-        # Но чтобы не дублировать, лучше просто ответить, но меню не сохранится.
-        # Можно отправить новое сообщение, а старое удалить. Для простоты:
-        await query.message.delete()
-        await context.bot.send_message(chat_id=user_id, text="Главное меню:", reply_markup=get_main_keyboard(user_id))
-
 # ---------- СОЗДАНИЕ ОПРОСА ----------
 async def start_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1426,7 +1413,6 @@ def main():
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
     app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
-    app.add_handler(CallbackQueryHandler(profile_callback, pattern="^profile_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
