@@ -1065,7 +1065,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 *Ваш профиль*\n\nНик: {nick}\nКласс: {user_class}",
             parse_mode="Markdown"
         )
-      elif text == "📊 Моя активность":
+    elif text == "📊 Моя активность":
         nick = get_user_nick(user_id)
         if not nick:
             await update.message.reply_text("❌ Не удалось определить ваш ник.")
