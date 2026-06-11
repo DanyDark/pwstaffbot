@@ -435,20 +435,18 @@ def mark_activity_for_nicks(ws, activity_name, nicks):
     return updated
 
 def get_user_activity_count(nick):
-    """Возвращает количество ячеек со значением 'БЫЛ' для данного ника на листе 'Активность игроков'"""
+    """Возвращает общее количество отметок 'БЫЛ' для данного ника (за всё время)"""
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
         return 0
     ws = get_or_create_activity_sheet(spreadsheet)
     try:
-        # Найти строку с этим ником
         cell = ws.find(nick, in_column=1)
         if not cell:
             return 0
         row_idx = cell.row
-        # Получить всю строку
         row_values = ws.row_values(row_idx)
-        # Считаем количество "БЫЛ" начиная со 2-го столбца
+        # Считаем "БЫЛ" начиная со 2-го столбца
         count = sum(1 for val in row_values[1:] if val == "БЫЛ")
         return count
     except Exception as e:
@@ -1067,27 +1065,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 *Ваш профиль*\n\nНик: {nick}\nКласс: {user_class}",
             parse_mode="Markdown"
         )
-    elif text == "📊 Моя активность":
+      elif text == "📊 Моя активность":
         nick = get_user_nick(user_id)
         if not nick:
-            await update.message.reply_text("Не удалось определить ник.")
+            await update.message.reply_text("❌ Не удалось определить ваш ник.")
             return
         activity_count = get_user_activity_count(nick)
+        # Красивое сообщение с эмодзи и жирным текстом
         await update.message.reply_text(
-            f"📊 *Ваша активность*\n\nВсего отметок «БЫЛ» в таблице: {activity_count}",
+            f"📊 *Ваша активность*\n\n"
+            f"┌ Всего отметок «БЫЛ»: *{activity_count}*\n"
+            f"└ (за всё время)\n\n"
+            f"💡 *Совет:* больше участвуйте в ГВГ, чтобы увеличить счёт!",
             parse_mode="Markdown"
         )
     elif text == "📝 Мои ответы":
         answers = get_user_current_poll_answers(user_id)
-        if answers is None:
-            await update.message.reply_text("Нет активного опроса.")
+        poll = get_active_poll()
+        if not poll:
+            await update.message.reply_text("📭 *Нет активного опроса*\nСейчас нет опросов для ответа.", parse_mode="Markdown")
         elif not answers:
-            await update.message.reply_text("Вы ещё не ответили на текущий опрос.")
+            await update.message.reply_text("❓ *Вы ещё не ответили* на текущий опрос.\nНажмите кнопки под сообщением опроса.", parse_mode="Markdown")
         else:
-            msg = "📝 *Ваши ответы на текущий опрос:*\n\n"
+            # Формируем красивый список ответов
+            text = "📝 *Ваши ответы на текущий опрос*\n\n"
             for meeting, ans in answers.items():
-                msg += f"• {meeting}: {ans}\n"
-            await update.message.reply_text(msg, parse_mode="Markdown")
+                # Эмодзи в зависимости от ответа
+                emoji = "✅" if ans == "да" else "❌" if ans == "нет" else "❓"
+                text += f"{emoji} *{meeting}*: {ans}\n"
+            await update.message.reply_text(text, parse_mode="Markdown")
     elif text == "❓ Помощь":
         await update.message.reply_text(
             "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
