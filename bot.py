@@ -201,7 +201,6 @@ def get_pending_users():
     conn.close()
     return rows
 
-# Вместо старой confirm_all_pending
 def confirm_all_pending():
     """Переносит всех ожидающих в таблицу users, очищает pending, возвращает список подтверждённых (user_id, nick, class)"""
     conn = sqlite3.connect(DB_FILE)
@@ -880,13 +879,7 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
             except Exception as e:
                 logging.error(f"Не удалось отправить опрос пользователю {uid}: {e}")
 
-    await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    confirmed = confirm_all_pending()  # список
-    count = len(confirmed)
+    await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
 
     # Добавляем подтверждённых ников в Google Таблицу (лист Активность игроков)
     spreadsheet = get_google_spreadsheet()
