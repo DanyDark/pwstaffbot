@@ -1476,7 +1476,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Основное меню
+        # Основное меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1553,20 +1553,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "💸 Выдача кеша" and is_admin(user_id):
         await process_cash_orders(update, context)
     elif text == "👥 Список пользователей" and is_admin(user_id):
-        users = get_all_users()
-        if not users:
-            await update.message.reply_text("Нет пользователей.")
-            return
-        msg = "📋 *Список пользователей:*\n"
-        for uid, nick, user_class, reg_date in users:
-            msg += f"• {nick} (класс: {user_class}) (ID: `{uid}`) — {reg_date}\n"
-            if len(msg) > 3800:
-                await update.message.reply_text(msg, parse_mode="Markdown")
-                msg = ""
-        if msg:
-            await update.message.reply_text(msg, parse_mode="Markdown")
+        await users_command(update, context)  # вызов новой функции
+    elif text == "✏️ Исправить профиль" and is_admin(user_id):
+        await edit_profile_menu(update, context)  # добавлено
     elif text == "✏️ Исправить класс" and is_admin(user_id):
         await edit_class_command(update, context)
+    elif text == "🔄 Исправить ник" and is_admin(user_id):
+        await edit_nick_command(update, context)
     elif text == "📊 Активность игроков" and is_admin(user_id):
         await activity_menu(update, context)
     elif text == "📝 Регистрация" and is_admin(user_id):
@@ -1806,7 +1799,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = "📋 *Список пользователей:*\n\n"
     for uid, nick, user_class, _ in users:
         message_text += f"• {nick} - {user_class}\n"
-        if len(message_text) > 3800:  # страховка
+        if len(message_text) > 3800:
             await update.message.reply_text(message_text, parse_mode="Markdown")
             message_text = ""
 
