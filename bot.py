@@ -462,6 +462,13 @@ def get_current_activity_sheet():
     if not spreadsheet:
         raise Exception("Не удалось подключиться к Google Sheets")
     return get_or_create_monthly_activity_sheet(spreadsheet)
+def find_column_by_header(ws, header_name):
+    """Возвращает номер столбца (1-базированный) по названию заголовка в первой строке"""
+    headers = ws.row_values(1)
+    for idx, h in enumerate(headers):
+        if h.strip().lower() == header_name.strip().lower():
+            return idx + 1
+    return None
 
 # Функция для поиска столбца "НИК" (он в столбце C, но для надёжности ищем по заголовку)
 def find_nick_column(ws):
