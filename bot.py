@@ -935,8 +935,9 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_step', None)
         context.user_data.pop('activity_nicks', None)
 
-def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks):
-    """Ставит 'БЫЛ ПЛ' для первого ника в ordered_nicks, 'БЫЛ' для остальных, в первую свободную ячейку диапазона активности"""
+def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=85):
+    """Ставит 'БЫЛ ПЛ' для первого распознанного ника, 'БЫЛ' для остальных.
+       Для каждого распознанного ника ищет наиболее похожий ник в столбце 'НИК' (нечёткое сравнение)."""
     nick_col = find_column_by_header(ws, "НИК")
     if nick_col is None:
         raise Exception("В листе не найден столбец 'НИК'")
@@ -945,28 +946,45 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks):
         raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
     
     start_col, end_col = ACTIVITY_COLUMNS[activity_name]
+    # Получаем все ники из таблицы (первый столбец - заголовок, со второй строки)
     all_values = ws.get_all_values()
-    updated = 0
+    # Создаём список (строка, ник) для всех строк, где есть ник
+    table_nicks = []
+    for row_idx, row in enumerate(all_values[1:], start=2):
+        if len(row) >= nick_col:
+            nick_val = row[nick_col-1].strip()
+            if nick_val:
+                table_nicks.append((row_idx, nick_val))
     
-    for idx, nick in enumerate(ordered_nicks):
-        is_first = (idx == 0)  # первый ник – ПЛ
-        # Находим строку, соответствующую нику
-        for row_idx, row in enumerate(all_values[1:], start=2):
-            if len(row) < nick_col:
-                continue
-            nick_in_sheet = row[nick_col-1].strip()
-            if not nick_in_sheet:
-                continue
-            if nick_in_sheet.lower() == nick.lower():
-                # Ищем первую пустую ячейку в диапазоне активности для этой строки
-                for col in range(start_col, end_col+1):
-                    if len(row) >= col and row[col-1] and row[col-1].strip():
-                        continue
-                    mark = "БЫЛ ПЛ" if is_first else "БЫЛ"
-                    ws.update_cell(row_idx, col, mark)
-                    updated += 1
-                    break
-                break  # нашли строку, переходим к следующему нику
+    updated = 0
+    # Для каждого распознанного ника (в порядке скриншота)
+    for idx, recognized_nick in enumerate(ordered_nicks):
+        is_first = (idx == 0)
+        # Ищем в table_nicks наиболее похожий ник
+        best_match_idx = None
+        best_ratio = 0
+        for row_idx, table_nick in table_nicks:
+            ratio = fuzz.ratio(recognized_nick.lower(), table_nick.lower())
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match_row = row_idx
+                best_match_nick = table_nick
+        if best_ratio >= threshold:
+            # Нашли соответствие – ставим отметку в первую свободную ячейку в диапазоне активности
+            # Получаем текущую строку (нужно свежее значение, так как ранее мы уже могли обновить)
+            row_values = ws.row_values(best_match_row)
+            for col in range(start_col, end_col+1):
+                if len(row_values) >= col and row_values[col-1] and row_values[col-1].strip():
+                    continue
+                mark = "БЫЛ ПЛ" if is_first else "БЫЛ"
+                ws.update_cell(best_match_row, col, mark)
+                updated += 1
+                # Удаляем эту строку из списка, чтобы не отмечать дважды
+                table_nicks = [(r, n) for r, n in table_nicks if r != best_match_row]
+                break
+        else:
+            # Не найдено – игнорируем (можно логировать)
+            logging.warning(f"Не найдено соответствие для распознанного ника '{recognized_nick}' (лучшее совпадение {best_ratio}%)")
     return updated
 
 # ---------- УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ (АДМИН) ----------
