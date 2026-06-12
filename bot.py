@@ -412,6 +412,7 @@ async def remove_all_keyboards(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 # ---------- GOOGLE SHEETS (Активность через шаблон) ----------
+# ---------- GOOGLE SHEETS (Активность через шаблон) ----------
 def get_google_spreadsheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -429,7 +430,6 @@ def get_google_spreadsheet():
 
 def get_or_create_monthly_activity_sheet(spreadsheet):
     """Возвращает лист активности для текущего месяца, создавая копию из шаблона при необходимости"""
-    # Ищем шаблон
     try:
         template = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
     except gspread.WorksheetNotFound:
@@ -441,62 +441,88 @@ def get_or_create_monthly_activity_sheet(spreadsheet):
     month = now.month
     sheet_name = f"Активность {month:02d}.{year}"
 
-    # Проверяем в БД, не создавали ли уже этот лист
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT sheet_name FROM activity_months WHERE year = ? AND month = ?", (year, month))
     row = cursor.fetchone()
     if row:
-        # Лист уже создан, пытаемся его получить
         try:
             ws = spreadsheet.worksheet(row[0])
             conn.close()
             return ws
         except gspread.WorksheetNotFound:
-            # Лист был удалён вручную, пересоздаём
             logging.warning(f"Лист {row[0]} не найден, пересоздаём")
 
-    # Создаём копию шаблона
     new_ws = template.duplicate(insert_sheet_index=0, new_sheet_name=sheet_name)
-    # Сохраняем в БД
     cursor.execute("INSERT INTO activity_months (year, month, sheet_name) VALUES (?, ?, ?)", (year, month, sheet_name))
     conn.commit()
     conn.close()
     return new_ws
 
 def get_current_activity_sheet():
-    """Основная функция для получения текущего листа активности"""
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
         raise Exception("Не удалось подключиться к Google Sheets")
     return get_or_create_monthly_activity_sheet(spreadsheet)
 
-def find_column_by_header(ws, header_name, start_col=1):
-    """Ищет номер столбца (1-базированный) по заголовку (без учёта регистра и лишних пробелов)"""
-    headers = ws.row_values(1)
+def get_header_row(ws):
+    """Возвращает номер строки, где находятся основные заголовки (ищем строку, содержащую 'НИК' и другие заголовки)"""
+    # Перебираем первые 10 строк
+    for row_num in range(1, 11):
+        row_vals = ws.row_values(row_num)
+        for idx, val in enumerate(row_vals):
+            if val and val.strip().upper() == "НИК":
+                return row_num
+    # Если не нашли, пробуем строку 3 (по шаблону)
+    return 3
+
+def find_column_by_header(ws, header_name, header_row=None):
+    """Ищет номер столбца (1-базированный) по заголовку в строке заголовков"""
+    if header_row is None:
+        header_row = get_header_row(ws)
+    headers = ws.row_values(header_row)
     for idx, h in enumerate(headers):
-        if h.strip().lower() == header_name.strip().lower():
+        if h and h.strip().lower() == header_name.strip().lower():
             return idx + 1
     return None
 
-def mark_activity_in_sheet(ws, activity_column_name, nicks):
-    """Ставит 'БЫЛ' в столбце activity_column_name для всех строк, где ник совпадает"""
-    # Находим столбец с никами
-    nick_col = find_column_by_header(ws, "НИК")
+def get_available_activities(ws):
+    """Возвращает список названий столбцов активностей (исключая столбец 'НИК')"""
+    header_row = get_header_row(ws)
+    headers = ws.row_values(header_row)
+    nick_col = find_column_by_header(ws, "НИК", header_row)
     if nick_col is None:
-        raise Exception("В листе не найден столбец 'НИК'")
-    # Находим столбец активности
-    act_col = find_column_by_header(ws, activity_column_name)
+        return []
+    activities = []
+    for idx, h in enumerate(headers):
+        if idx + 1 == nick_col:
+            continue
+        h_clean = h.strip() if h else ""
+        if h_clean and h_clean not in ["Общая ЗП", "Профа", "ПРИМЕЧАНИЕ", "АКТИВКА 1", "АКТИВКА 2"]:  # фильтруем лишние
+            activities.append(h_clean)
+    return activities
+
+def mark_activity_in_sheet(ws, activity_column_name, nicks):
+    """Ставит 'БЫЛ' в столбце activity_column_name для всех строк, где ник совпадает (по столбцу НИК)"""
+    header_row = get_header_row(ws)
+    nick_col = find_column_by_header(ws, "НИК", header_row)
+    if nick_col is None:
+        raise Exception("Не найден столбец 'НИК'")
+    act_col = find_column_by_header(ws, activity_column_name, header_row)
     if act_col is None:
         raise Exception(f"Не найден столбец '{activity_column_name}'")
 
-    # Получаем все значения
     all_values = ws.get_all_values()
     updated = 0
-    for row_idx, row in enumerate(all_values[1:], start=2):
+    # Пропускаем строки заголовков (все строки до header_row)
+    for row_idx in range(header_row, len(all_values)):
+        row = all_values[row_idx]
+        if len(row) < nick_col:
+            continue
         nick_in_sheet = row[nick_col-1].strip() if len(row) >= nick_col else ''
         if nick_in_sheet and nick_in_sheet.lower() in [n.lower() for n in nicks]:
-            ws.update_cell(row_idx, act_col, "БЫЛ")
+            # Обновляем ячейку
+            ws.update_cell(row_idx+1, act_col, "БЫЛ")
             updated += 1
     return updated
 
@@ -504,18 +530,21 @@ def get_user_activity_count(nick):
     """Возвращает количество 'БЫЛ' для данного ника в текущем листе активности"""
     try:
         ws = get_current_activity_sheet()
-        nick_col = find_column_by_header(ws, "НИК")
+        header_row = get_header_row(ws)
+        nick_col = find_column_by_header(ws, "НИК", header_row)
         if nick_col is None:
             return 0
         all_values = ws.get_all_values()
-        # Находим все столбцы, где есть "БЫЛ"
         count = 0
-        for row in all_values[1:]:
-            if row and len(row) >= nick_col and row[nick_col-1].strip().lower() == nick.lower():
-                # Считаем количество "БЫЛ" в строке, начиная с 1-го столбца (можно уточнить)
-                # Для простоты считаем по всем столбцам кроме столбца с ником
+        for row_idx in range(header_row, len(all_values)):
+            row = all_values[row_idx]
+            if len(row) < nick_col:
+                continue
+            nick_in_sheet = row[nick_col-1].strip()
+            if nick_in_sheet.lower() == nick.lower():
+                # Считаем количество "БЫЛ" во всей строке
                 for col_idx, val in enumerate(row):
-                    if col_idx != nick_col-1 and val == "БЫЛ":
+                    if val == "БЫЛ":
                         count += 1
                 break
         return count
