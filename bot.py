@@ -1361,33 +1361,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Отмена
+    # ---------- ОТМЕНА ----------
     if text == "❌ Отмена":
         if context.user_data.get('cash_order'):
             del context.user_data['cash_order']
             await update.message.reply_text("Заказ кеша отменён.", reply_markup=get_main_keyboard(user_id))
             return
-            
-    # Исправление класса
-        if context.user_data.get('edit_class_mode'):
-            await handle_edit_class(update, context)
-            return
-            
-      # Отказ от заявок
-        if context.user_data.get('reject_mode'):
-            await handle_reject_pending(update, context)
-            return
-
-    # Исправление ника
-        if context.user_data.get('edit_nick_mode'):
-            await handle_edit_nick(update, context)
-            return
-        
         if context.user_data.get('edit_class_mode'):
             context.user_data.pop('edit_class_mode', None)
             context.user_data.pop('edit_class_nick', None)
             context.user_data.pop('edit_class_user_id', None)
             await update.message.reply_text("Редактирование класса отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        if context.user_data.get('edit_nick_mode'):
+            context.user_data.pop('edit_nick_mode', None)
+            context.user_data.pop('edit_old_nick', None)
+            context.user_data.pop('edit_target_user_id', None)
+            await update.message.reply_text("Редактирование ника отменено.", reply_markup=get_main_keyboard(user_id))
             return
         if context.user_data.get('poll_creation'):
             del context.user_data['poll_creation']
@@ -1412,6 +1402,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
             return
 
+    # ---------- СПЕЦИАЛЬНЫЕ РЕЖИМЫ ----------
     # Ручной опрос админом (ввод ника)
     if context.user_data.get('admin_poll') and context.user_data['admin_poll'].get('step') == 'awaiting_nick':
         await admin_poll_nick_received(update, context)
@@ -1422,16 +1413,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_edit_class(update, context)
         return
 
+    # Редактирование ника
+    if context.user_data.get('edit_nick_mode'):
+        await handle_edit_nick(update, context)
+        return
+
+    # Отказ от заявок (режим выбора пользователя)
+    if context.user_data.get('reject_mode'):
+        await handle_reject_pending(update, context)
+        return
+
     # Выбор активности после распознавания
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
         return
 
-    # Заказ кеша: описание (здесь не используется, так как мы убрали описание, но оставим для совместимости)
-    # if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'description':
-    #     await handle_cash_order_description(update, context)
-    #     return
-
+    # ---------- РЕГИСТРАЦИЯ ----------
     # Регистрация: ник
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
@@ -1469,14 +1466,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
 
-    # Проверка валидности
+    # ---------- ПРОВЕРКА ВАЛИДНОСТИ ----------
     if not is_user_valid(user_id):
         await update.message.reply_text(
             "❌ Вы не зарегистрированы. Нажмите /start для регистрации."
         )
         return
 
-        # Основное меню
+    # ---------- ОСНОВНОЕ МЕНЮ ----------
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1553,9 +1550,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "💸 Выдача кеша" and is_admin(user_id):
         await process_cash_orders(update, context)
     elif text == "👥 Список пользователей" and is_admin(user_id):
-        await users_command(update, context)  # вызов новой функции
+        await users_command(update, context)
     elif text == "✏️ Исправить профиль" and is_admin(user_id):
-        await edit_profile_menu(update, context)  # добавлено
+        await edit_profile_menu(update, context)
     elif text == "✏️ Исправить класс" and is_admin(user_id):
         await edit_class_command(update, context)
     elif text == "🔄 Исправить ник" and is_admin(user_id):
@@ -1572,7 +1569,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reject_pending_menu(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
-
+        
 # ---------- СОЗДАНИЕ ОПРОСА (ГВГ) ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
