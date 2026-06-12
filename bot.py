@@ -5,11 +5,12 @@ import json
 import traceback
 import requests
 import base64
-from datetime import datetime
+from datetime import datetime, time
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram import ReplyKeyboardRemove
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Google Sheets
 import gspread
@@ -132,7 +133,6 @@ def get_user_id_by_nick(nick):
     return row[0] if row else None
 
 def is_nick_taken(nick):
-    """Проверяет, занят ли ник в users или pending_users"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM users WHERE nick = ?", (nick,))
@@ -179,7 +179,6 @@ def is_admin(user_id):
     return user_id in ADMIN_LIST
 
 def is_user_valid(user_id):
-    """Пользователь считается валидным, если он есть в таблице users"""
     return is_registered(user_id)
 
 # ---------- ЗАЯВКИ НА РЕГИСТРАЦИЮ ----------
@@ -202,7 +201,6 @@ def get_pending_users():
     return rows
 
 def confirm_all_pending():
-    """Переносит всех ожидающих в таблицу users, очищает pending, возвращает список подтверждённых (user_id, nick, class)"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, nick, class FROM pending_users")
@@ -279,7 +277,6 @@ def get_all_polls_meetings():
     return sorted(meetings_set)
 
 def get_user_current_poll_answers(user_id):
-    """Возвращает словарь {meeting: answer} для активного опроса, если пользователь ответил"""
     poll = get_active_poll()
     if not poll:
         return None
@@ -294,6 +291,17 @@ def get_user_current_poll_answers(user_id):
     if rows:
         return {meeting: answer for meeting, answer in rows}
     return {}
+
+def get_non_responders(poll_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, nick FROM users")
+    all_users = cursor.fetchall()
+    cursor.execute("SELECT DISTINCT user_id FROM poll_responses WHERE poll_id = ?", (poll_id,))
+    responders = set(row[0] for row in cursor.fetchall())
+    conn.close()
+    non_responders = [(uid, nick) for uid, nick in all_users if uid not in responders]
+    return non_responders
 
 # ---------- OCR.space ----------
 def extract_nicks_from_image(image_bytes):
@@ -344,7 +352,6 @@ def fuzzy_match_nicks(recognized_nicks, known_nicks, threshold=85):
     return matched, unmatched
 
 async def remove_all_keyboards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для массового удаления клавиатур у всех пользователей."""
     if update.effective_user.id not in ADMIN_LIST:
         await update.message.reply_text("У вас нет прав на эту команду.")
         return
@@ -435,7 +442,6 @@ def mark_activity_for_nicks(ws, activity_name, nicks):
     return updated
 
 def get_user_activity_count(nick):
-    """Возвращает общее количество отметок 'БЫЛ' для данного ника (за всё время)"""
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
         return 0
@@ -446,7 +452,6 @@ def get_user_activity_count(nick):
             return 0
         row_idx = cell.row
         row_values = ws.row_values(row_idx)
-        # Считаем "БЫЛ" начиная со 2-го столбца
         count = sum(1 for val in row_values[1:] if val == "БЫЛ")
         return count
     except Exception as e:
@@ -527,7 +532,7 @@ def create_cash_order(user_id, nick, photo_file_id):
     cursor.execute('''
         INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status)
         VALUES (?, ?, ?, ?, 'pending')
-    ''', (user_id, nick, photo_file_id, "Золотые яйца"))  # фиксированное описание
+    ''', (user_id, nick, photo_file_id, "Золотые яйца"))
     conn.commit()
     conn.close()
 
@@ -605,10 +610,7 @@ async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Нет новых заявок на кеш.")
         return
     order_id, uid, nick, photo_file_id, description = order
-    # Сохраняем текущую заявку в контексте
     context.user_data['current_cash_order'] = {'order_id': order_id, 'user_id': uid, 'nick': nick}
-    
-    # Отправляем фото и информацию
     try:
         await context.bot.send_photo(
             chat_id=user_id,
@@ -617,9 +619,7 @@ async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     except Exception as e:
         await update.message.reply_text(f"Не удалось отправить фото. Ошибка: {e}")
-        # Всё равно показываем текст
         await update.message.reply_text(f"👤 Ник: {nick}\n🎭 Класс: {get_user_class(uid)}")
-    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Отправлено", callback_data=f"cash_done_{order_id}")],
         [InlineKeyboardButton("❌ Отклонено", callback_data=f"cash_reject_{order_id}")]
@@ -664,7 +664,6 @@ async def cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(uid, "❌ Ваша заявка на кеш отклонена. Свяжитесь с администратором.")
             except Exception as e:
                 logging.error(f"Не удалось уведомить {uid}: {e}")
-    # После обработки – переходим к следующей заявке
     await process_cash_orders(update, context)
 
 # ---------- РЕДАКТИРОВАНИЕ КЛАССА ----------
@@ -749,7 +748,6 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
 
-    # Получаем все ники из зарегистрированных пользователей
     users = get_all_users()
     known_nicks = [nick for _, nick, _, _ in users]
 
@@ -858,14 +856,13 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    confirmed = confirm_all_pending()  # список
+    confirmed = confirm_all_pending()
     count = len(confirmed)
 
-    # Добавляем подтверждённых ников в Google Таблицу (лист Активность игроков)
     spreadsheet = get_google_spreadsheet()
     if spreadsheet:
         ws = get_or_create_activity_sheet(spreadsheet)
-        current_nicks = ws.col_values(1)[1:]  # пропускаем заголовок
+        current_nicks = ws.col_values(1)[1:]
         current_nicks_lower = [n.strip().lower() for n in current_nicks if n.strip()]
         added = 0
         for _, nick, _ in confirmed:
@@ -876,7 +873,6 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
         if added:
             logging.info(f"Добавлено {added} новых ников в лист активности")
 
-    # Отправляем активный опрос только что подтверждённым пользователям
     active_poll = get_active_poll()
     if active_poll:
         for uid, nick, _ in confirmed:
@@ -888,33 +884,42 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
 
     await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
 
-    # Добавляем подтверждённых ников в Google Таблицу (лист Активность игроков)
-    spreadsheet = get_google_spreadsheet()
-    if spreadsheet:
-        ws = get_or_create_activity_sheet(spreadsheet)
-        current_nicks = ws.col_values(1)[1:]  # пропускаем заголовок
-        current_nicks_lower = [n.strip().lower() for n in current_nicks if n.strip()]
-        added = 0
-        for _, nick, _ in confirmed:
-            if nick.lower() not in current_nicks_lower:
-                row_num = len(current_nicks) + 2 + added
-                ws.update_cell(row_num, 1, nick)
-                added += 1
-        if added:
-            logging.info(f"Добавлено {added} новых ников в лист активности")
+# ---------- ПЛАНИРОВЩИК ОБЪЯВЛЕНИЙ (БОССЫ) ----------
+async def send_announcement_to_all(text):
+    users = get_all_users()
+    for uid, _, _, _ in users:
+        try:
+            await app.bot.send_message(chat_id=uid, text=text)
+        except Exception as e:
+            logging.error(f"Не удалось отправить объявление {uid}: {e}")
 
-    # Отправляем активный опрос только что подтверждённым пользователям
-    active_poll = get_active_poll()
-    if active_poll:
-        for uid, nick, _ in confirmed:
-            try:
-                await send_first_question(uid, active_poll, context)
-                logging.info(f"Отправлен опрос новому пользователю {nick} (ID: {uid})")
-            except Exception as e:
-                logging.error(f"Не удалось отправить опрос пользователю {uid}: {e}")
+async def create_boss_announcement(boss_name, day_of_week, time_str):
+    text = f"📢 *{boss_name} сегодня!*\nСбор в {time_str}.\n\nУчаствуйте!"
+    await send_announcement_to_all(text)
 
-    await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
-    
+def schedule_boss_announcements(scheduler):
+    # Комендант – среда, 10:00
+    scheduler.add_job(
+        create_boss_announcement,
+        'cron',
+        day_of_week='wed',
+        hour=10,
+        minute=0,
+        args=("Комендант", "среду", "20:45"),
+        id="komendant_announce"
+    )
+    # Баньши – воскресенье, 10:00
+    scheduler.add_job(
+        create_boss_announcement,
+        'cron',
+        day_of_week='sun',
+        hour=10,
+        minute=0,
+        args=("Баньши", "воскресенье", "14:30"),
+        id="banyshi_announce"
+    )
+    logging.info("Планировщик объявлений о боссах запущен")
+
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [
@@ -928,10 +933,19 @@ def get_main_keyboard(user_id):
 
 def get_admin_keyboard():
     keyboard = [
-        [KeyboardButton("📝 Создать опрос"), KeyboardButton("📤 Разослать опрос")],
-        [KeyboardButton("📈 Результаты опроса"), KeyboardButton("📋 Текущий опрос")],
-        [KeyboardButton("🚫 Завершить опрос"), KeyboardButton("🏰 Управление кланом")],
+        [KeyboardButton("📊 Управление опросами")],
+        [KeyboardButton("🏰 Управление кланом")],
         [KeyboardButton("💸 Выдача кеша"), KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_polls_management_keyboard():
+    keyboard = [
+        [KeyboardButton("📝 Создать опрос (ГВГ)")],
+        [KeyboardButton("📤 Разослать опрос")],
+        [KeyboardButton("📈 Результаты опроса")],
+        [KeyboardButton("❌ Не ответившие")],
+        [KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -947,14 +961,6 @@ def get_class_keyboard():
     classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
     keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-
-def get_profile_keyboard():
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Моя активность", callback_data="profile_activity")],
-        [InlineKeyboardButton("📝 Ответы на текущий опрос", callback_data="profile_poll_answers")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="profile_back")]
-    ])
-    return keyboard
 
 # ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -993,7 +999,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if context.user_data.get('poll_creation'):
             del context.user_data['poll_creation']
-            await update.message.reply_text("Создание опроса отменено.", reply_markup=get_admin_keyboard())
+            await update.message.reply_text("Создание опроса отменено.", reply_markup=get_polls_management_keyboard())
             return
         if context.user_data.get('activity_mode'):
             context.user_data.pop('activity_mode', None)
@@ -1061,7 +1067,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Основное меню
-    # Основное меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1075,7 +1080,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось определить ваш ник.")
             return
         activity_count = get_user_activity_count(nick)
-        # Красивое сообщение с эмодзи и жирным текстом
         await update.message.reply_text(
             f"📊 *Ваша активность*\n\n"
             f"┌ Всего отметок «БЫЛ»: *{activity_count}*\n"
@@ -1091,13 +1095,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif not answers:
             await update.message.reply_text("❓ *Вы ещё не ответили* на текущий опрос.\nНажмите кнопки под сообщением опроса.", parse_mode="Markdown")
         else:
-            # Формируем красивый список ответов
-            text = "📝 *Ваши ответы на текущий опрос*\n\n"
+            msg_text = "📝 *Ваши ответы на текущий опрос*\n\n"
             for meeting, ans in answers.items():
-                # Эмодзи в зависимости от ответа
                 emoji = "✅" if ans == "да" else "❌" if ans == "нет" else "❓"
-                text += f"{emoji} *{meeting}*: {ans}\n"
-            await update.message.reply_text(text, parse_mode="Markdown")
+                msg_text += f"{emoji} *{meeting}*: {ans}\n"
+            await update.message.reply_text(msg_text, parse_mode="Markdown")
     elif text == "❓ Помощь":
         await update.message.reply_text(
             "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
@@ -1108,22 +1110,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
     elif text == "🔙 Назад" and is_admin(user_id):
         await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
-    elif text == "📝 Создать опрос" and is_admin(user_id):
-        await start_poll_creation(update, context)
-        return
+    elif text == "📊 Управление опросами" and is_admin(user_id):
+        await update.message.reply_text("Управление опросами:", reply_markup=get_polls_management_keyboard())
+    elif text == "📝 Создать опрос (ГВГ)" and is_admin(user_id):
+        context.user_data['poll_creation'] = {'step': 'text'}
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        await update.message.reply_text(
+            "Введите текст объявления для ГВГ-опроса.\n\nДля отмены нажмите «❌ Отмена».",
+            reply_markup=keyboard
+        )
     elif text == "📤 Разослать опрос" and is_admin(user_id):
         await send_poll_to_all(update, context)
     elif text == "📈 Результаты опроса" and is_admin(user_id):
         await export_command(update, context)
-    elif text == "📋 Текущий опрос" and is_admin(user_id):
+    elif text == "❌ Не ответившие" and is_admin(user_id):
         poll = get_active_poll()
-        if poll:
-            await update.message.reply_text(f"*Текущий опрос:*\n\n{poll['text']}\n\nВстречи: {', '.join(poll['meetings'])}", parse_mode="Markdown")
-        else:
+        if not poll:
             await update.message.reply_text("Нет активного опроса.")
-    elif text == "🚫 Завершить опрос" and is_admin(user_id):
-        deactivate_poll()
-        await update.message.reply_text("Текущий опрос завершён.")
+            return
+        non_responders = get_non_responders(poll['id'])
+        if not non_responders:
+            await update.message.reply_text("✅ Все пользователи ответили на текущий опрос!")
+            return
+        msg = "❌ *Не ответили на опрос:*\n\n"
+        for uid, nick in non_responders:
+            msg += f"• {nick} (ID: `{uid}`)\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
     elif text == "🏰 Управление кланом" and is_admin(user_id):
         await update.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
     elif text == "💸 Выдача кеша" and is_admin(user_id):
@@ -1153,16 +1165,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await confirm_all_pending_command(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
-# ---------- СОЗДАНИЕ ОПРОСА ----------
-async def start_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    context.user_data['poll_creation'] = {'step': 'text'}
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text("Введите текст объявления для опроса.\n\nДля отмены нажмите «❌ Отмена».", reply_markup=keyboard)
 
+# ---------- СОЗДАНИЕ ОПРОСА (ГВГ) ----------
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) or 'poll_creation' not in context.user_data:
@@ -1171,13 +1175,15 @@ async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text
     if text == "❌ Отмена":
         del context.user_data['poll_creation']
-        await update.message.reply_text("Создание опроса отменено.", reply_markup=get_admin_keyboard())
+        await update.message.reply_text("Создание опроса отменено.", reply_markup=get_polls_management_keyboard())
         return
     if data['step'] == 'text':
         data['text'] = text
         data['meetings'] = []
         data['step'] = 'meeting'
-        await update.message.reply_text("Теперь вводите встречи по одной строке.\nКогда закончите, нажмите кнопку «✅ Завершить создание» под сообщением.\n\nДля отмены отправьте «❌ Отмена».")
+        await update.message.reply_text(
+            "Теперь вводите названия встреч (ГВГ) по одной строке.\nКогда закончите, нажмите кнопку «✅ Завершить создание» под сообщением.\n\nДля отмены отправьте «❌ Отмена»."
+        )
     elif data['step'] == 'meeting':
         data['meetings'].append(text.strip())
         await update.message.reply_text(
@@ -1198,9 +1204,9 @@ async def finish_poll_creation_callback(update: Update, context: ContextTypes.DE
         return
     create_poll(data['text'], data['meetings'])
     meetings_list = ", ".join([f'"{m}"' for m in data['meetings']])
-    await query.edit_message_text(f"✅ Опрос создан!\n\nГВГ: {meetings_list}")
+    await query.edit_message_text(f"✅ Опрос (ГВГ) создан!\n\nГВГ: {meetings_list}")
     del context.user_data['poll_creation']
-    await query.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
+    await query.message.reply_text("Управление опросами:", reply_markup=get_polls_management_keyboard())
 
 # ---------- РАССЫЛКА ОПРОСА ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1402,8 +1408,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ЗАПУСК ----------
 def main():
+    global app
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Планировщик
+    scheduler = AsyncIOScheduler()
+    schedule_boss_announcements(scheduler)
+    scheduler.start()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
