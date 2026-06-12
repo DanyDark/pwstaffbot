@@ -783,7 +783,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('edit_class_mode', None)
         context.user_data.pop('edit_class_nick', None)
         context.user_data.pop('edit_class_user_id', None)
-        await update.message.reply_text("Редактирование отменено.", reply_markup=get_main_keyboard(user_id))
+        await update.message.reply_text("Редактирование отменено.", reply_markup=get_admin_keyboard())
         return
     if 'edit_class_nick' not in context.user_data:
         target_nick = text
@@ -813,6 +813,58 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_mode', None)
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
+    # Возвращаем в админ-панель
+    await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
+# ---------- ИСПРАВЛЕНИЕ НИКА -------------
+async def edit_nick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    context.user_data['edit_nick_mode'] = True
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    await update.message.reply_text("Введите старый ник пользователя, чей ник нужно изменить:", reply_markup=keyboard)
+
+async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('edit_nick_mode'):
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        context.user_data.pop('edit_nick_mode', None)
+        context.user_data.pop('edit_old_nick', None)
+        context.user_data.pop('edit_target_user_id', None)
+        await update.message.reply_text("Редактирование отменено.", reply_markup=get_admin_keyboard())
+        return
+    if 'edit_old_nick' not in context.user_data:
+        old_nick = text
+        target_user_id = get_user_id_by_nick(old_nick)
+        if not target_user_id:
+            await update.message.reply_text(f"Пользователь с ником {old_nick} не найден. Попробуйте ещё раз или нажмите «❌ Отмена».")
+            return
+        context.user_data['edit_old_nick'] = old_nick
+        context.user_data['edit_target_user_id'] = target_user_id
+        await update.message.reply_text("Введите новый ник для этого пользователя:")
+        return
+    new_nick = text
+    if is_nick_taken(new_nick):
+        await update.message.reply_text("❌ Этот ник уже занят другим пользователем. Введите другой.")
+        return
+    target_user_id = context.user_data['edit_target_user_id']
+    # Обновляем ник в базе
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET nick = ? WHERE user_id = ?", (new_nick, target_user_id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"Ник пользователя {context.user_data['edit_old_nick']} изменён на {new_nick}.")
+    context.user_data.pop('edit_nick_mode', None)
+    context.user_data.pop('edit_old_nick', None)
+    context.user_data.pop('edit_target_user_id', None)
+    # Возвращаем в админ-панель
+    await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
 
 # ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -997,9 +1049,62 @@ async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [KeyboardButton("📋 Список ожидания")],
         [KeyboardButton("✅ Подтвердить всех")],
+        [KeyboardButton("❌ Отказать")],
         [KeyboardButton("🔙 Назад")]
     ]
     await update.message.reply_text("Управление регистрацией:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    
+def get_reject_keyboard():
+    pending = get_pending_users()
+    if not pending:
+        return None
+    # Формируем кнопки в 2 столбца
+    keyboard = []
+    row = []
+    for uid, nick, user_class, _ in pending:
+        row.append(KeyboardButton(f"❌ {nick}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([KeyboardButton("🔙 Назад")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+async def reject_pending_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    keyboard = get_reject_keyboard()
+    if not keyboard:
+        await update.message.reply_text("Нет ожидающих регистрации.")
+        return
+    await update.message.reply_text("Выберите пользователя для отмены заявки:", reply_markup=keyboard)
+    context.user_data['reject_mode'] = True
+
+async def handle_reject_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get('reject_mode'):
+        return
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    text = update.message.text
+    if text == "🔙 Назад":
+        context.user_data.pop('reject_mode', None)
+        await registration_menu(update, context)
+        return
+    if text.startswith("❌ "):
+        nick_to_reject = text[2:]
+        # Удаляем заявку из pending_users
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pending_users WHERE nick = ?", (nick_to_reject,))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"❌ Заявка для {nick_to_reject} отклонена.")
+        # Показываем обновлённый список для отказа
+        await reject_pending_menu(update, context)
+        return
 
 async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1210,10 +1315,23 @@ def get_polls_management_keyboard():
 def get_clan_management_keyboard():
     keyboard = [
         [KeyboardButton("👥 Список пользователей")],
-        [KeyboardButton("✏️ Исправить класс"), KeyboardButton("📊 Активность игроков")],
+        [KeyboardButton("✏️ Исправить профиль"), KeyboardButton("📊 Активность игроков")],
         [KeyboardButton("📝 Регистрация"), KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def edit_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    keyboard = [
+        [KeyboardButton("✏️ Исправить класс")],
+        [KeyboardButton("🔄 Исправить ник")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    await update.message.reply_text("Выберите, что хотите исправить:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
 def get_class_keyboard():
     classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
@@ -1249,6 +1367,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del context.user_data['cash_order']
             await update.message.reply_text("Заказ кеша отменён.", reply_markup=get_main_keyboard(user_id))
             return
+            
+    # Исправление класса
+        if context.user_data.get('edit_class_mode'):
+            await handle_edit_class(update, context)
+            return
+            
+      # Отказ от заявок
+        if context.user_data.get('reject_mode'):
+            await handle_reject_pending(update, context)
+            return
+
+    # Исправление ника
+        if context.user_data.get('edit_nick_mode'):
+            await handle_edit_nick(update, context)
+            return
+        
         if context.user_data.get('edit_class_mode'):
             context.user_data.pop('edit_class_mode', None)
             context.user_data.pop('edit_class_nick', None)
@@ -1272,6 +1406,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get('admin_poll'):
             del context.user_data['admin_poll']
             await update.message.reply_text("Ручной опрос отменён.", reply_markup=get_main_keyboard(user_id))
+            return
+        if context.user_data.get('reject_mode'):
+            context.user_data.pop('reject_mode', None)
+            await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
             return
 
     # Ручной опрос админом (ввод ника)
@@ -1437,6 +1575,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await list_pending_command(update, context)
     elif text == "✅ Подтвердить всех" and is_admin(user_id):
         await confirm_all_pending_command(update, context)
+    elif text == "❌ Отказать" and is_admin(user_id):
+        await reject_pending_menu(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
@@ -1662,14 +1802,34 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not users:
         await update.message.reply_text("Нет пользователей.")
         return
-    msg = "📋 *Список пользователей:*\n"
-    for uid, nick, user_class, reg_date in users:
-        msg += f"• {nick} (класс: {user_class}) (ID: `{uid}`) — {reg_date}\n"
-        if len(msg) > 3800:
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            msg = ""
-    if msg:
-        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    message_text = "📋 *Список пользователей:*\n\n"
+    for uid, nick, user_class, _ in users:
+        message_text += f"• {nick} - {user_class}\n"
+        if len(message_text) > 3800:  # страховка
+            await update.message.reply_text(message_text, parse_mode="Markdown")
+            message_text = ""
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆘 Показать ID всех пользователей", callback_data="show_all_ids")]
+    ])
+
+    await update.message.reply_text(message_text, parse_mode="Markdown", reply_markup=keyboard)
+    
+async def show_all_ids_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    users = get_all_users()
+    if not users:
+        await query.edit_message_text("Нет пользователей.")
+        return
+    text = "🆔 *ID всех пользователей:*\n\n"
+    for uid, nick, user_class, _ in users:
+        text += f"• {nick} - {user_class} - `{uid}`\n"
+        if len(text) > 3800:
+            await query.edit_message_text(text, parse_mode="Markdown")
+            return
+    await query.edit_message_text(text, parse_mode="Markdown")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('activity_mode') and not context.user_data.get('activity_step'):
@@ -1702,7 +1862,7 @@ def main():
     app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("edit_class", edit_class_command))
-
+    app.add_handler(CallbackQueryHandler(show_all_ids_callback, pattern="^show_all_ids$"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
