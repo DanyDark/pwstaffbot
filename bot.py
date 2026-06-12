@@ -521,13 +521,13 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
 
 # ---------- КЕШ-ЗАЯВКИ ----------
-def create_cash_order(user_id, nick, photo_file_id, description):
+def create_cash_order(user_id, nick, photo_file_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status)
         VALUES (?, ?, ?, ?, 'pending')
-    ''', (user_id, nick, photo_file_id, description))
+    ''', (user_id, nick, photo_file_id, "Золотые яйца"))  # фиксированное описание
     conn.commit()
     conn.close()
 
@@ -553,11 +553,14 @@ def get_next_pending_order():
 async def cash_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_valid(user_id):
-        await update.message.reply_text("Вы не зарегистрированы или ваш ник удалён. Нажмите /start.")
+        await update.message.reply_text("Вы не зарегистрированы. Нажмите /start.")
         return
     context.user_data['cash_order'] = {'step': 'photo'}
     keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text("Пожалуйста, отправьте фото из личного кабинета с донатом.", reply_markup=keyboard)
+    await update.message.reply_text(
+        "📸 Отправьте скриншот из личного кабинета с донатом.\n\nПосле этого кешбек будет выдан золотыми яйцами.",
+        reply_markup=keyboard
+    )
 
 async def handle_cash_order_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -568,24 +571,19 @@ async def handle_cash_order_photo(update: Update, context: ContextTypes.DEFAULT_
         return
     photo_file = await update.message.photo[-1].get_file()
     photo_file_id = photo_file.file_id
-    context.user_data['cash_order']['photo_file_id'] = photo_file_id
-    context.user_data['cash_order']['step'] = 'description'
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text("Что хотите получить? (опишите)", reply_markup=keyboard)
-
-async def handle_cash_order_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.user_data.get('cash_order') or context.user_data['cash_order'].get('step') != 'description':
-        return
-    description = update.message.text
     nick = get_user_nick(user_id)
-    photo_file_id = context.user_data['cash_order']['photo_file_id']
-    create_cash_order(user_id, nick, photo_file_id, description)
+    create_cash_order(user_id, nick, photo_file_id)
     del context.user_data['cash_order']
-    await update.message.reply_text("✅ Заявка отправлена. Ожидайте получения.", reply_markup=get_main_keyboard(user_id))
+    await update.message.reply_text(
+        "✅ Заявка принята! Кешбек будет выдан золотыми яйцами.",
+        reply_markup=get_main_keyboard(user_id)
+    )
     for admin_id in ADMIN_LIST:
         try:
-            await context.bot.send_message(admin_id, f"📦 Новая заявка на кеш от {nick} (ID: {user_id})\nОписание: {description}")
+            await context.bot.send_message(
+                admin_id,
+                f"📦 Новая заявка на кеш от {nick} (ID: {user_id})\nСтатус: ожидает выдачи."
+            )
         except Exception as e:
             logging.error(f"Не удалось уведомить админа {admin_id}: {e}")
 
@@ -607,11 +605,21 @@ async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Нет новых заявок на кеш.")
         return
     order_id, uid, nick, photo_file_id, description = order
+    # Сохраняем текущую заявку в контексте
     context.user_data['current_cash_order'] = {'order_id': order_id, 'user_id': uid, 'nick': nick}
+    
+    # Отправляем фото и информацию
     try:
-        await context.bot.send_photo(chat_id=user_id, photo=photo_file_id, caption=f"👤 Ник: {nick}\n📝 Что хочет: {description}")
+        await context.bot.send_photo(
+            chat_id=user_id,
+            photo=photo_file_id,
+            caption=f"👤 Ник: {nick}\n🎭 Класс: {get_user_class(uid)}\n📦 Заявка на кеш (кешбек золотыми яйцами)"
+        )
     except Exception as e:
-        await update.message.reply_text(f"Не удалось отправить фото. Ошибка: {e}\nТекст заявки: {nick} - {description}")
+        await update.message.reply_text(f"Не удалось отправить фото. Ошибка: {e}")
+        # Всё равно показываем текст
+        await update.message.reply_text(f"👤 Ник: {nick}\n🎭 Класс: {get_user_class(uid)}")
+    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Отправлено", callback_data=f"cash_done_{order_id}")],
         [InlineKeyboardButton("❌ Отклонено", callback_data=f"cash_reject_{order_id}")]
@@ -638,7 +646,7 @@ async def cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row:
             uid = row[0]
             try:
-                await context.bot.send_message(uid, "✅ Ваша заявка на кеш выполнена! Приятной игры!")
+                await context.bot.send_message(uid, "✅ Кешбек выдан золотыми яйцами! Спасибо за активность.")
             except Exception as e:
                 logging.error(f"Не удалось уведомить {uid}: {e}")
     elif data.startswith("cash_reject_"):
@@ -656,6 +664,7 @@ async def cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(uid, "❌ Ваша заявка на кеш отклонена. Свяжитесь с администратором.")
             except Exception as e:
                 logging.error(f"Не удалось уведомить {uid}: {e}")
+    # После обработки – переходим к следующей заявке
     await process_cash_orders(update, context)
 
 # ---------- РЕДАКТИРОВАНИЕ КЛАССА ----------
@@ -1005,11 +1014,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Выбор активности после распознавания
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
-        return
-
-    # Заказ кеша: описание
-    if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'description':
-        await handle_cash_order_description(update, context)
         return
 
     # Регистрация: ник
