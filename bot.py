@@ -1407,15 +1407,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеща». Для активности используйте пункт «📊 Активность игроков».")
 
 # ---------- ЗАПУСК ----------
-def main():
-    global app
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Планировщик
+async def post_init(app: Application):
     scheduler = AsyncIOScheduler()
     schedule_boss_announcements(scheduler)
     scheduler.start()
+    app.bot_data['scheduler'] = scheduler
+    logging.info("Планировщик объявлений запущен")
+
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.post_init = post_init
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_command))
