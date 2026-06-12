@@ -364,7 +364,7 @@ def extract_nicks_from_image(image_bytes):
         return []
 
 # ---------- НЕЧЁТКОЕ СРАВНЕНИЕ ----------
-def fuzzy_match_nicks(recognized_nicks, known_nicks, threshold=85):
+def fuzzy_match_nicks(recognized_nicks, known_nicks, threshold=70):
     matched = {}
     unmatched = []
     for rn in recognized_nicks:
@@ -462,6 +462,7 @@ def get_current_activity_sheet():
     if not spreadsheet:
         raise Exception("Не удалось подключиться к Google Sheets")
     return get_or_create_monthly_activity_sheet(spreadsheet)
+
 def find_column_by_header(ws, header_name):
     """Возвращает номер столбца (1-базированный) по названию заголовка в первой строке"""
     headers = ws.row_values(1)
@@ -814,7 +815,6 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_user_id', None)
 
 # ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
-# ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -847,8 +847,7 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     users = get_all_users()
     known_nicks = [nick for _, nick, _, _ in users]
 
-    # Для каждого распознанного ника ищем лучшее совпадение
-    # Сохраняем порядок: итоговый список будет той же длины, что и raw_nicks
+    # Для каждого распознанного ника ищем лучшее совпадение (порог 70)
     final_ordered_nicks = []
     matched_count = 0
     unmatched_nicks = []
@@ -860,14 +859,14 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_match = kn
-        if best_ratio >= 85 and best_match:
+        if best_ratio >= 70 and best_match:
             final_ordered_nicks.append(best_match)
             matched_count += 1
         else:
             final_ordered_nicks.append(rn)
             unmatched_nicks.append(rn)
 
-    context.user_data['activity_nicks'] = final_ordered_nicks  # упорядоченный список
+    context.user_data['activity_nicks'] = final_ordered_nicks
     context.user_data['activity_raw'] = raw_nicks
     context.user_data['activity_matched_count'] = matched_count
     context.user_data['activity_unmatched'] = unmatched_nicks
@@ -915,14 +914,24 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         ws = get_current_activity_sheet()
-        # Передаём список ников с порядком, а также флаг, что первый ник – ПЛ
-        updated = mark_activity_in_sheet_with_pl(ws, activity, nicks)
+        updated = mark_activity_in_sheet_with_pl(ws, activity, nicks, threshold=70)
         nick_col = find_column_by_header(ws, "НИК")
         all_nicks_in_sheet = []
         if nick_col:
             all_vals = ws.get_all_values()
             all_nicks_in_sheet = [row[nick_col-1].strip() for row in all_vals[1:] if row and len(row) >= nick_col and row[nick_col-1].strip()]
-        not_found = [nick for nick in nicks if nick.lower() not in [n.lower() for n in all_nicks_in_sheet]]
+        
+        # Нечёткое сравнение для формирования списка не найденных (порог 70)
+        not_found = []
+        for recognized_nick in nicks:
+            best_ratio = 0
+            for table_nick in all_nicks_in_sheet:
+                ratio = fuzz.ratio(recognized_nick.lower(), table_nick.lower())
+                if ratio > best_ratio:
+                    best_ratio = ratio
+            if best_ratio < 70:
+                not_found.append(recognized_nick)
+        
         await update.message.reply_text(
             f"✅ Готово!\nАктивность: {activity}\nПоставлено отметок: {updated}\nРаспознано ников: {len(nicks)}"
             + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
@@ -935,7 +944,7 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_step', None)
         context.user_data.pop('activity_nicks', None)
 
-def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=85):
+def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=70):
     """Ставит 'БЫЛ ПЛ' для первого распознанного ника, 'БЫЛ' для остальных.
        Для каждого распознанного ника ищет наиболее похожий ник в столбце 'НИК' (нечёткое сравнение)."""
     nick_col = find_column_by_header(ws, "НИК")
@@ -946,9 +955,7 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=8
         raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
     
     start_col, end_col = ACTIVITY_COLUMNS[activity_name]
-    # Получаем все ники из таблицы (первый столбец - заголовок, со второй строки)
     all_values = ws.get_all_values()
-    # Создаём список (строка, ник) для всех строк, где есть ник
     table_nicks = []
     for row_idx, row in enumerate(all_values[1:], start=2):
         if len(row) >= nick_col:
@@ -957,11 +964,9 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=8
                 table_nicks.append((row_idx, nick_val))
     
     updated = 0
-    # Для каждого распознанного ника (в порядке скриншота)
     for idx, recognized_nick in enumerate(ordered_nicks):
         is_first = (idx == 0)
-        # Ищем в table_nicks наиболее похожий ник
-        best_match_idx = None
+        best_match_row = None
         best_ratio = 0
         for row_idx, table_nick in table_nicks:
             ratio = fuzz.ratio(recognized_nick.lower(), table_nick.lower())
@@ -970,8 +975,6 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=8
                 best_match_row = row_idx
                 best_match_nick = table_nick
         if best_ratio >= threshold:
-            # Нашли соответствие – ставим отметку в первую свободную ячейку в диапазоне активности
-            # Получаем текущую строку (нужно свежее значение, так как ранее мы уже могли обновить)
             row_values = ws.row_values(best_match_row)
             for col in range(start_col, end_col+1):
                 if len(row_values) >= col and row_values[col-1] and row_values[col-1].strip():
@@ -979,11 +982,9 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=8
                 mark = "БЫЛ ПЛ" if is_first else "БЫЛ"
                 ws.update_cell(best_match_row, col, mark)
                 updated += 1
-                # Удаляем эту строку из списка, чтобы не отмечать дважды
                 table_nicks = [(r, n) for r, n in table_nicks if r != best_match_row]
                 break
         else:
-            # Не найдено – игнорируем (можно логировать)
             logging.warning(f"Не найдено соответствие для распознанного ника '{recognized_nick}' (лучшее совпадение {best_ratio}%)")
     return updated
 
@@ -1025,12 +1026,6 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
         return
     confirmed = confirm_all_pending()
     count = len(confirmed)
-
-    # Убираем запись в старую таблицу активности (она больше не нужна)
-    # В новой системе ники автоматически берутся из шаблона, который редактируется вручную.
-    # Поэтому после подтверждения регистрации мы ничего не добавляем в Google Sheets.
-    # Администратор должен сам вписать новых игроков в шаблон, чтобы они появились в активности.
-    # При желании можно добавить автоматическое добавление, но по условию задачи – не требуется.
 
     active_poll = get_active_poll()
     if active_poll:
@@ -1684,44 +1679,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_cash_order_photo(update, context)
         return
     await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
-
-async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
-        await update.message.reply_text("❌ Не заданы переменные GOOGLE_CREDS или GOOGLE_SHEET_ID.")
-        return
-    poll = get_active_poll()
-    if not poll:
-        await update.message.reply_text("Нет активного опроса для экспорта.")
-        return
-    spreadsheet = get_google_spreadsheet()
-    if spreadsheet is None:
-        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
-        return
-    grouped = get_responses_grouped_by_meeting(poll['id'])
-    if not grouped:
-        await update.message.reply_text("Нет ответов на опрос. Экспорт не выполнен.")
-        return
-    headers = ["Ник", "Класс", "Ответ пользователя"]
-    try:
-        for meeting, responses in grouped.items():
-            sheet_name = sanitize_sheet_name(meeting)
-            try:
-                worksheet = spreadsheet.worksheet(sheet_name)
-                worksheet.clear()
-            except gspread.WorksheetNotFound:
-                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
-            data = [headers]
-            for nick, user_class, answer in responses:
-                data.append([nick, user_class, answer])
-            worksheet.update(values=data, range_name='A1')
-        await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(grouped.keys())}")
-    except Exception as e:
-        logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
 
 # ---------- ЗАПУСК ----------
 async def post_init(app: Application):
