@@ -532,20 +532,6 @@ def get_user_activity_count(nick):
     except Exception as e:
         logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
         return 0
-def get_available_activities(ws):
-    """Возвращает список названий столбцов активностей (исключая столбец 'НИК' и пустые)"""
-    headers = ws.row_values(1)
-    nick_col = find_column_by_header(ws, "НИК")
-    if nick_col is None:
-        return []
-    activities = []
-    for idx, h in enumerate(headers):
-        if idx+1 == nick_col:
-            continue
-        h_clean = h.strip()
-        if h_clean:
-            activities.append(h_clean)
-    return activities
 
 # ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
 def get_responses_grouped_by_meeting(poll_id):
@@ -577,6 +563,17 @@ def get_responses_grouped_by_meeting(poll_id):
         grouped[meeting].append((ext_nick, "Внешний", answer))
     conn.close()
     return grouped
+    
+def sanitize_sheet_name(name):
+    forbidden = r'[]:*?/\\'
+    for ch in forbidden:
+        name = name.replace(ch, '')
+    if len(name) > 100:
+        name = name[:100]
+    name = name.strip()
+    if not name:
+        name = "Лист"
+    return name
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1608,35 +1605,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_cash_order_photo(update, context)
         return
     await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
-def get_responses_grouped_by_meeting(poll_id):
-    grouped = {}
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # Обычные ответы пользователей
-    cursor.execute('''
-        SELECT u.nick, u.class, pr.meeting, pr.answer
-        FROM poll_responses pr
-        JOIN users u ON pr.user_id = u.user_id
-        WHERE pr.poll_id = ?
-    ''', (poll_id,))
-    rows = cursor.fetchall()
-    for nick, user_class, meeting, answer in rows:
-        if meeting not in grouped:
-            grouped[meeting] = []
-        grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
-    # Внешние ответы (админ за другого)
-    cursor.execute('''
-        SELECT external_nick, meeting, answer
-        FROM external_responses
-        WHERE poll_id = ?
-    ''', (poll_id,))
-    ext_rows = cursor.fetchall()
-    for ext_nick, meeting, answer in ext_rows:
-        if meeting not in grouped:
-            grouped[meeting] = []
-        grouped[meeting].append((ext_nick, "Внешний", answer))
-    conn.close()
-    return grouped
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
