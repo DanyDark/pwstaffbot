@@ -4,3 +4,4 @@ google-auth
 requests
 Pillow
 rapidfuzz
+APScheduler
