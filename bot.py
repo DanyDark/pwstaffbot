@@ -412,7 +412,6 @@ async def remove_all_keyboards(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 # ---------- GOOGLE SHEETS (Активность через шаблон) ----------
-# ---------- GOOGLE SHEETS (Активность через шаблон) ----------
 def get_google_spreadsheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -429,7 +428,6 @@ def get_google_spreadsheet():
         return None
 
 def get_or_create_monthly_activity_sheet(spreadsheet):
-    """Возвращает лист активности для текущего месяца, создавая копию из шаблона при необходимости"""
     try:
         template = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
     except gspread.WorksheetNotFound:
@@ -465,93 +463,75 @@ def get_current_activity_sheet():
         raise Exception("Не удалось подключиться к Google Sheets")
     return get_or_create_monthly_activity_sheet(spreadsheet)
 
-def get_header_row(ws):
-    """Возвращает номер строки, где находятся основные заголовки (ищем строку, содержащую 'НИК' и другие заголовки)"""
-    # Перебираем первые 10 строк
-    for row_num in range(1, 11):
-        row_vals = ws.row_values(row_num)
-        for idx, val in enumerate(row_vals):
-            if val and val.strip().upper() == "НИК":
-                return row_num
-    # Если не нашли, пробуем строку 3 (по шаблону)
-    return 3
-
-def find_column_by_header(ws, header_name, header_row=None):
-    """Ищет номер столбца (1-базированный) по заголовку в строке заголовков"""
-    if header_row is None:
-        header_row = get_header_row(ws)
-    headers = ws.row_values(header_row)
+# Функция для поиска столбца "НИК" (он в столбце C, но для надёжности ищем по заголовку)
+def find_nick_column(ws):
+    headers = ws.row_values(1)
     for idx, h in enumerate(headers):
-        if h and h.strip().lower() == header_name.strip().lower():
+        if h.strip().lower() == "ник":
             return idx + 1
     return None
 
+# Конфигурация активностей: название -> (start_col, end_col) 1-базированные
+ACTIVITY_COLUMNS = {
+    "Комендант": (4, 8),   # D-H
+    "Баньши": (9, 12),     # I-L
+    "ГВГ": (13, 16)        # M-P
+}
+
 def get_available_activities(ws):
-    """Возвращает список названий столбцов активностей (исключая столбец 'НИК')"""
-    header_row = get_header_row(ws)
-    headers = ws.row_values(header_row)
-    nick_col = find_column_by_header(ws, "НИК", header_row)
-    if nick_col is None:
-        return []
-    activities = []
-    for idx, h in enumerate(headers):
-        if idx + 1 == nick_col:
-            continue
-        h_clean = h.strip() if h else ""
-        if h_clean and h_clean not in ["Общая ЗП", "Профа", "ПРИМЕЧАНИЕ", "АКТИВКА 1", "АКТИВКА 2"]:  # фильтруем лишние
-            activities.append(h_clean)
-    return activities
+    """Возвращает список активностей, которые есть в конфигурации (Комендант, Баньши, ГВГ)"""
+    return list(ACTIVITY_COLUMNS.keys())
 
-def mark_activity_in_sheet(ws, activity_column_name, nicks):
-    """Ставит 'БЫЛ' в столбце activity_column_name для всех строк, где ник совпадает (по столбцу НИК)"""
-    header_row = get_header_row(ws)
-    nick_col = find_column_by_header(ws, "НИК", header_row)
+def mark_activity_in_sheet(ws, activity_name, nicks):
+    """Ставит 'БЫЛ' в первую свободную ячейку в диапазоне активности для каждого найденного ника"""
+    nick_col = find_nick_column(ws)
     if nick_col is None:
-        raise Exception("Не найден столбец 'НИК'")
-    act_col = find_column_by_header(ws, activity_column_name, header_row)
-    if act_col is None:
-        raise Exception(f"Не найден столбец '{activity_column_name}'")
-
+        raise Exception("В листе не найден столбец 'НИК'")
+    
+    if activity_name not in ACTIVITY_COLUMNS:
+        raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
+    
+    start_col, end_col = ACTIVITY_COLUMNS[activity_name]
     all_values = ws.get_all_values()
     updated = 0
-    # Пропускаем строки заголовков (все строки до header_row)
-    for row_idx in range(header_row, len(all_values)):
-        row = all_values[row_idx]
+    for row_idx, row in enumerate(all_values[1:], start=2):
         if len(row) < nick_col:
             continue
-        nick_in_sheet = row[nick_col-1].strip() if len(row) >= nick_col else ''
-        if nick_in_sheet and nick_in_sheet.lower() in [n.lower() for n in nicks]:
-            # Обновляем ячейку
-            ws.update_cell(row_idx+1, act_col, "БЫЛ")
+        nick_in_sheet = row[nick_col-1].strip()
+        if not nick_in_sheet:
+            continue
+        if nick_in_sheet.lower() not in [n.lower() for n in nicks]:
+            continue
+        # Ищем первую пустую ячейку в диапазоне активности для этой строки
+        for col in range(start_col, end_col+1):
+            if len(row) >= col and row[col-1] and row[col-1].strip():
+                continue
+            # Пустая ячейка найдена – ставим "БЫЛ"
+            ws.update_cell(row_idx, col, "БЫЛ")
             updated += 1
+            break
     return updated
 
 def get_user_activity_count(nick):
-    """Возвращает количество 'БЫЛ' для данного ника в текущем листе активности"""
+    """Возвращает количество 'БЫЛ' для данного ника в текущем листе активности (по всем столбцам, кроме столбца 'НИК')"""
     try:
         ws = get_current_activity_sheet()
-        header_row = get_header_row(ws)
-        nick_col = find_column_by_header(ws, "НИК", header_row)
+        nick_col = find_nick_column(ws)
         if nick_col is None:
             return 0
         all_values = ws.get_all_values()
         count = 0
-        for row_idx in range(header_row, len(all_values)):
-            row = all_values[row_idx]
-            if len(row) < nick_col:
-                continue
-            nick_in_sheet = row[nick_col-1].strip()
-            if nick_in_sheet.lower() == nick.lower():
-                # Считаем количество "БЫЛ" во всей строке
+        for row in all_values[1:]:
+            if len(row) >= nick_col and row[nick_col-1].strip().lower() == nick.lower():
+                # Считаем "БЫЛ" во всех столбцах, кроме столбца с ником
                 for col_idx, val in enumerate(row):
-                    if val == "БЫЛ":
+                    if col_idx != nick_col-1 and val == "БЫЛ":
                         count += 1
                 break
         return count
     except Exception as e:
         logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
         return 0
-
 def get_available_activities(ws):
     """Возвращает список названий столбцов активностей (исключая столбец 'НИК' и пустые)"""
     headers = ws.row_values(1)
@@ -838,7 +818,7 @@ async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['activity_mode'] = True
     keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     await update.message.reply_text(
-        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность (ГВГ/Босс).\n\nДля отмены нажмите «❌ Отмена».",
+        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность.\n\nДоступные активности: Комендант, Баньши, ГВГ.\n\nДля отмены нажмите «❌ Отмена».",
         reply_markup=keyboard
     )
 
@@ -859,7 +839,6 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
 
-    # Получаем все ники из зарегистрированных пользователей
     users = get_all_users()
     known_nicks = [nick for _, nick, _, _ in users]
 
@@ -880,20 +859,7 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     if unmatched:
         stats += f"Неопознанные: {', '.join(unmatched)}\n\n"
 
-    # Получаем текущий лист активности и список доступных активностей
-    try:
-        ws = get_current_activity_sheet()
-        activities = get_available_activities(ws)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при работе с Google Sheets: {e}")
-        context.user_data.pop('activity_mode', None)
-        return
-
-    if not activities:
-        await update.message.reply_text("В листе активности не найдено столбцов с активностями (есть только столбец 'НИК'). Проверьте шаблон.")
-        context.user_data.pop('activity_mode', None)
-        return
-
+    activities = ["Комендант", "Баньши", "ГВГ"]
     keyboard = []
     for act in activities:
         keyboard.append([KeyboardButton(act)])
@@ -927,9 +893,8 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
     try:
         ws = get_current_activity_sheet()
         updated = mark_activity_in_sheet(ws, activity, nicks)
-        # Сообщаем результат
+        nick_col = find_nick_column(ws)
         all_nicks_in_sheet = []
-        nick_col = find_column_by_header(ws, "НИК")
         if nick_col:
             all_vals = ws.get_all_values()
             all_nicks_in_sheet = [row[nick_col-1].strip() for row in all_vals[1:] if row and len(row) >= nick_col and row[nick_col-1].strip()]
