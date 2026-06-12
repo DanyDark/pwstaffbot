@@ -807,6 +807,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_user_id', None)
 
 # ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
+# ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -839,22 +840,40 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     users = get_all_users()
     known_nicks = [nick for _, nick, _, _ in users]
 
-    matched, unmatched = fuzzy_match_nicks(raw_nicks, known_nicks, threshold=85)
-    final_nicks = list(matched.values()) + unmatched
+    # Для каждого распознанного ника ищем лучшее совпадение
+    # Сохраняем порядок: итоговый список будет той же длины, что и raw_nicks
+    final_ordered_nicks = []
+    matched_count = 0
+    unmatched_nicks = []
+    for rn in raw_nicks:
+        best_match = None
+        best_ratio = 0
+        for kn in known_nicks:
+            ratio = fuzz.ratio(rn.lower(), kn.lower())
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = kn
+        if best_ratio >= 85 and best_match:
+            final_ordered_nicks.append(best_match)
+            matched_count += 1
+        else:
+            final_ordered_nicks.append(rn)
+            unmatched_nicks.append(rn)
 
-    context.user_data['activity_nicks'] = final_nicks
+    context.user_data['activity_nicks'] = final_ordered_nicks  # упорядоченный список
     context.user_data['activity_raw'] = raw_nicks
-    context.user_data['activity_matched'] = matched
+    context.user_data['activity_matched_count'] = matched_count
+    context.user_data['activity_unmatched'] = unmatched_nicks
 
-    if not final_nicks:
+    if not final_ordered_nicks:
         await update.message.reply_text("Не удалось распознать ни одного ника после сопоставления.")
         return
 
     stats = f"✅ Распознано: {len(raw_nicks)} ников.\n" \
-            f"🎯 Совпало с зарегистрированными: {len(matched)}.\n" \
-            f"❓ Не распознано (будут записаны как есть): {len(unmatched)}.\n\n"
-    if unmatched:
-        stats += f"Неопознанные: {', '.join(unmatched)}\n\n"
+            f"🎯 Совпало с зарегистрированными: {matched_count}.\n" \
+            f"❓ Не распознано (будут записаны как есть): {len(unmatched_nicks)}.\n\n"
+    if unmatched_nicks:
+        stats += f"Неопознанные: {', '.join(unmatched_nicks)}\n\n"
 
     activities = ["Комендант", "Баньши", "ГВГ"]
     keyboard = []
@@ -862,7 +881,7 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard.append([KeyboardButton(act)])
     keyboard.append([KeyboardButton("❌ Отмена")])
     await update.message.reply_text(
-        stats + f"Список для записи: {', '.join(final_nicks)}\n\nВыберите активность:",
+        stats + f"Список для записи (в порядке скриншота): {', '.join(final_ordered_nicks)}\n\nВыберите активность:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
     context.user_data['activity_step'] = 'select_activity'
@@ -889,15 +908,16 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         ws = get_current_activity_sheet()
-        updated = mark_activity_in_sheet(ws, activity, nicks)
-        nick_col = find_nick_column(ws)
+        # Передаём список ников с порядком, а также флаг, что первый ник – ПЛ
+        updated = mark_activity_in_sheet_with_pl(ws, activity, nicks)
+        nick_col = find_column_by_header(ws, "НИК")
         all_nicks_in_sheet = []
         if nick_col:
             all_vals = ws.get_all_values()
             all_nicks_in_sheet = [row[nick_col-1].strip() for row in all_vals[1:] if row and len(row) >= nick_col and row[nick_col-1].strip()]
         not_found = [nick for nick in nicks if nick.lower() not in [n.lower() for n in all_nicks_in_sheet]]
         await update.message.reply_text(
-            f"✅ Готово!\nАктивность: {activity}\nПоставлено отметок «БЫЛ»: {updated}\nРаспознано ников: {len(nicks)}"
+            f"✅ Готово!\nАктивность: {activity}\nПоставлено отметок: {updated}\nРаспознано ников: {len(nicks)}"
             + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
             reply_markup=get_main_keyboard(user_id)
         )
@@ -907,6 +927,40 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_mode', None)
         context.user_data.pop('activity_step', None)
         context.user_data.pop('activity_nicks', None)
+
+def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks):
+    """Ставит 'БЫЛ ПЛ' для первого ника в ordered_nicks, 'БЫЛ' для остальных, в первую свободную ячейку диапазона активности"""
+    nick_col = find_column_by_header(ws, "НИК")
+    if nick_col is None:
+        raise Exception("В листе не найден столбец 'НИК'")
+    
+    if activity_name not in ACTIVITY_COLUMNS:
+        raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
+    
+    start_col, end_col = ACTIVITY_COLUMNS[activity_name]
+    all_values = ws.get_all_values()
+    updated = 0
+    
+    for idx, nick in enumerate(ordered_nicks):
+        is_first = (idx == 0)  # первый ник – ПЛ
+        # Находим строку, соответствующую нику
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if len(row) < nick_col:
+                continue
+            nick_in_sheet = row[nick_col-1].strip()
+            if not nick_in_sheet:
+                continue
+            if nick_in_sheet.lower() == nick.lower():
+                # Ищем первую пустую ячейку в диапазоне активности для этой строки
+                for col in range(start_col, end_col+1):
+                    if len(row) >= col and row[col-1] and row[col-1].strip():
+                        continue
+                    mark = "БЫЛ ПЛ" if is_first else "БЫЛ"
+                    ws.update_cell(row_idx, col, mark)
+                    updated += 1
+                    break
+                break  # нашли строку, переходим к следующему нику
+    return updated
 
 # ---------- УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ (АДМИН) ----------
 async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
