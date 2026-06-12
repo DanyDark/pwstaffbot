@@ -96,6 +96,18 @@ def init_db():
             requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Таблица для внешних ответов (админ проходит за другого)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS external_responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poll_id INTEGER,
+            external_nick TEXT,
+            meeting TEXT,
+            answer TEXT,
+            admin_id INTEGER,
+            responded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -260,6 +272,16 @@ def save_responses(user_id, poll_id, responses_dict):
             INSERT OR REPLACE INTO poll_responses (user_id, poll_id, meeting, answer, responded_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
         ''', (user_id, poll_id, meeting, answer))
+    conn.commit()
+    conn.close()
+
+def save_external_response(poll_id, external_nick, meeting, answer, admin_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO external_responses (poll_id, external_nick, meeting, answer, admin_id)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (poll_id, external_nick, meeting, answer, admin_id))
     conn.commit()
     conn.close()
 
@@ -462,6 +484,7 @@ def get_responses_grouped_by_meeting(poll_id):
     grouped = {}
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Обычные ответы пользователей
     cursor.execute('''
         SELECT u.nick, u.class, pr.meeting, pr.answer
         FROM poll_responses pr
@@ -469,11 +492,22 @@ def get_responses_grouped_by_meeting(poll_id):
         WHERE pr.poll_id = ?
     ''', (poll_id,))
     rows = cursor.fetchall()
-    conn.close()
     for nick, user_class, meeting, answer in rows:
         if meeting not in grouped:
             grouped[meeting] = []
         grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
+    # Внешние ответы (админ за другого)
+    cursor.execute('''
+        SELECT external_nick, meeting, answer
+        FROM external_responses
+        WHERE poll_id = ?
+    ''', (poll_id,))
+    ext_rows = cursor.fetchall()
+    for ext_nick, meeting, answer in ext_rows:
+        if meeting not in grouped:
+            grouped[meeting] = []
+        grouped[meeting].append((ext_nick, "Внешний", answer))
+    conn.close()
     return grouped
 
 def sanitize_sheet_name(name):
@@ -920,6 +954,121 @@ def schedule_boss_announcements(scheduler):
     )
     logging.info("Планировщик объявлений о боссах запущен")
 
+# ---------- РУЧНОЙ ОПРОС АДМИНОМ ЗА ДРУГОГО ----------
+async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает процесс: ввод ника, затем опрос"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    poll = get_active_poll()
+    if not poll:
+        await update.message.reply_text("Нет активного опроса.")
+        return
+    context.user_data['admin_poll'] = {'step': 'awaiting_nick'}
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    await update.message.reply_text(
+        "Введите ник игрока, за которого хотите пройти опрос.\n(Ник может быть любым, даже не зарегистрированным в боте)",
+        reply_markup=keyboard
+    )
+
+async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получили ник, начинаем опрос"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id) or 'admin_poll' not in context.user_data:
+        return
+    data = context.user_data['admin_poll']
+    if data.get('step') != 'awaiting_nick':
+        return
+    nick = update.message.text.strip()
+    if nick == "❌ Отмена":
+        del context.user_data['admin_poll']
+        await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
+        return
+    if not nick:
+        await update.message.reply_text("Ник не может быть пустым. Попробуйте ещё раз.")
+        return
+    data['external_nick'] = nick
+    poll = get_active_poll()
+    if not poll:
+        del context.user_data['admin_poll']
+        await update.message.reply_text("Активный опрос исчез. Попробуйте позже.")
+        return
+    data['poll_id'] = poll['id']
+    data['meetings'] = poll['meetings']
+    data['current_index'] = 0
+    data['answers'] = {}
+    data['step'] = 'polling'
+    await send_admin_poll_question(update, context, user_id)
+
+async def send_admin_poll_question(update_or_query, context, user_id):
+    """Отправляет очередной вопрос админу"""
+    data = context.user_data.get('admin_poll')
+    if not data:
+        return
+    idx = data['current_index']
+    meetings = data['meetings']
+    if idx >= len(meetings):
+        # Все вопросы заданы – показываем сводку
+        answers = data['answers']
+        summary = "✅ *Ваши ответы:*\n\n"
+        for m in meetings:
+            ans = answers.get(m, "❌ Не отвечен")
+            summary += f"• {m} → {ans}\n"
+        summary += "\nСохранить ответы?"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, сохранить", callback_data="admin_poll_save")],
+            [InlineKeyboardButton("❌ Нет, отменить", callback_data="admin_poll_cancel")]
+        ])
+        await context.bot.send_message(chat_id=user_id, text=summary, parse_mode="Markdown", reply_markup=keyboard)
+        return
+    meeting = meetings[idx]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да", callback_data=f"admin_poll_ans_да"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"admin_poll_ans_нет"),
+            InlineKeyboardButton("❓ Не знаю", callback_data=f"admin_poll_ans_не знаю")
+        ]
+    ])
+    text = f"📢 *Опрос за другого*\n\n{poll['text']}\n\nВопрос {idx+1} из {len(meetings)}:\n{meeting}\n\nВаш ответ:"
+    if hasattr(update_or_query, 'message'):
+        await update_or_query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    else:
+        await update_or_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+    if not is_admin(user_id) or 'admin_poll' not in context.user_data:
+        await query.edit_message_text("Сессия опроса не найдена. Начните заново.")
+        return
+    poll_data = context.user_data['admin_poll']
+    if data.startswith("admin_poll_ans_"):
+        answer = data.split('_')[3]
+        meeting = poll_data['meetings'][poll_data['current_index']]
+        poll_data['answers'][meeting] = answer
+        poll_data['current_index'] += 1
+        await query.edit_message_text(f"✅ Ответ на '{meeting}' сохранён. Следующий вопрос...")
+        await send_admin_poll_question(update, context, user_id)
+    elif data == "admin_poll_save":
+        # Сохраняем все ответы в external_responses
+        poll_id = poll_data['poll_id']
+        external_nick = poll_data['external_nick']
+        admin_id = user_id
+        answers = poll_data['answers']
+        for meeting, ans in answers.items():
+            save_external_response(poll_id, external_nick, meeting, ans, admin_id)
+        del context.user_data['admin_poll']
+        await query.edit_message_text(f"✅ Ответы для пользователя {external_nick} сохранены! Они будут учтены в результатах опроса.")
+        # Вернуть админа в подменю опросов
+        await context.bot.send_message(chat_id=user_id, text="Управление опросами:", reply_markup=get_polls_management_keyboard())
+    elif data == "admin_poll_cancel":
+        del context.user_data['admin_poll']
+        await query.edit_message_text("Опрос отменён. Ответы не сохранены.")
+        await context.bot.send_message(chat_id=user_id, text="Управление опросами:", reply_markup=get_polls_management_keyboard())
+
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [
@@ -941,11 +1090,9 @@ def get_admin_keyboard():
 
 def get_polls_management_keyboard():
     keyboard = [
-        [KeyboardButton("📝 Создать опрос (ГВГ)")],
-        [KeyboardButton("📤 Разослать опрос")],
-        [KeyboardButton("📈 Результаты опроса")],
-        [KeyboardButton("❌ Не ответившие")],
-        [KeyboardButton("🔙 Назад")]
+        [KeyboardButton("📝 Создать опрос (ГВГ)"), KeyboardButton("👥 Пройти за другого")],
+        [KeyboardButton("📤 Разослать опрос"), KeyboardButton("📈 Результаты опроса")],
+        [KeyboardButton("❌ Не ответившие"), KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1011,6 +1158,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             await update.message.reply_text("Регистрация отменена.", reply_markup=get_main_keyboard(user_id))
             return
+        if context.user_data.get('admin_poll'):
+            del context.user_data['admin_poll']
+            await update.message.reply_text("Ручной опрос отменён.", reply_markup=get_main_keyboard(user_id))
+            return
 
     # Редактирование класса
     if context.user_data.get('edit_class_mode'):
@@ -1066,6 +1217,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Админский ручной опрос (ввод ника)
+    if context.user_data.get('admin_poll') and context.user_data['admin_poll'].get('step') == 'awaiting_nick':
+        await admin_poll_nick_received(update, context)
+        return
+
     # Основное меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
@@ -1119,6 +1275,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Введите текст объявления для ГВГ-опроса.\n\nДля отмены нажмите «❌ Отмена».",
             reply_markup=keyboard
         )
+    elif text == "👥 Пройти за другого" and is_admin(user_id):
+        await admin_poll_for_other(update, context)
     elif text == "📤 Разослать опрос" and is_admin(user_id):
         await send_poll_to_all(update, context)
     elif text == "📈 Результаты опроса" and is_admin(user_id):
@@ -1404,7 +1562,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'photo':
         await handle_cash_order_photo(update, context)
         return
-    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеща». Для активности используйте пункт «📊 Активность игроков».")
+    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
 
 # ---------- ЗАПУСК ----------
 async def post_init(app: Application):
@@ -1435,6 +1593,7 @@ def main():
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
     app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
+    app.add_handler(CallbackQueryHandler(admin_poll_callback, pattern="^admin_poll_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
