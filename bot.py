@@ -995,21 +995,21 @@ async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Активный опрос исчез. Попробуйте позже.")
         return
     data['poll_id'] = poll['id']
+    data['poll_text'] = poll['text']
     data['meetings'] = poll['meetings']
     data['current_index'] = 0
     data['answers'] = {}
     data['step'] = 'polling'
     await send_admin_poll_question(update, context, user_id)
 
-async def send_admin_poll_question(update_or_query, context, user_id):
-    """Отправляет очередной вопрос админу"""
+async def send_admin_poll_question(update, context, user_id):
     data = context.user_data.get('admin_poll')
     if not data:
         return
     idx = data['current_index']
     meetings = data['meetings']
     if idx >= len(meetings):
-        # Все вопросы заданы – показываем сводку
+        # сводка
         answers = data['answers']
         summary = "✅ *Ваши ответы:*\n\n"
         for m in meetings:
@@ -1031,11 +1031,7 @@ async def send_admin_poll_question(update_or_query, context, user_id):
         ]
     ])
     text = f"📢 *Опрос за другого*\n\n{poll['text']}\n\nВопрос {idx+1} из {len(meetings)}:\n{meeting}\n\nВаш ответ:"
-    if hasattr(update_or_query, 'message'):
-        await update_or_query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-    else:
-        await update_or_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-
+    await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
 async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1163,6 +1159,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ручной опрос отменён.", reply_markup=get_main_keyboard(user_id))
             return
 
+    # ========== РУЧНОЙ ОПРОС АДМИНОМ (ввод ника) – ДО ВСЕГО ОСТАЛЬНОГО ==========
+    if context.user_data.get('admin_poll') and context.user_data['admin_poll'].get('step') == 'awaiting_nick':
+        await admin_poll_nick_received(update, context)
+        return
+
     # Редактирование класса
     if context.user_data.get('edit_class_mode'):
         await handle_edit_class(update, context)
@@ -1171,6 +1172,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Выбор активности после распознавания
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
+        return
+
+    # Заказ кеша: описание
+    if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'description':
+        await handle_cash_order_description(update, context)
         return
 
     # Регистрация: ник
@@ -1217,12 +1223,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Админский ручной опрос (ввод ника)
-    if context.user_data.get('admin_poll') and context.user_data['admin_poll'].get('step') == 'awaiting_nick':
-        await admin_poll_nick_received(update, context)
-        return
-
-    # Основное меню
+    # Основное меню (всё остальное)
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
