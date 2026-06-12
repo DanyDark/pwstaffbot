@@ -96,7 +96,6 @@ def init_db():
             requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Таблица для внешних ответов (админ проходит за другого)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS external_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +105,15 @@ def init_db():
             answer TEXT,
             admin_id INTEGER,
             responded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS activity_months (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER,
+            month INTEGER,
+            sheet_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
@@ -403,7 +411,7 @@ async def remove_all_keyboards(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown"
     )
 
-# ---------- GOOGLE SHEETS (Активность игроков) ----------
+# ---------- GOOGLE SHEETS (Активность через шаблон) ----------
 def get_google_spreadsheet():
     if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
         logging.error("Переменные окружения для Google Sheets не заданы")
@@ -419,145 +427,116 @@ def get_google_spreadsheet():
         logging.error(f"Ошибка подключения: {e}")
         return None
 
-def get_or_create_activity_sheet(spreadsheet):
-    sheet_name = "Активность игроков"
+def get_or_create_monthly_activity_sheet(spreadsheet):
+    """Возвращает лист активности для текущего месяца, создавая копию из шаблона при необходимости"""
+    # Ищем шаблон
     try:
-        ws = spreadsheet.worksheet(sheet_name)
+        template = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="100")
-        ws.update_cell(1, 1, "Ник")
-    return ws
+        logging.error("Лист 'ШАБЛОН АКТИВНОСТИ' не найден в Google Sheets. Создайте его вручную.")
+        raise Exception("Отсутствует шаблон активности")
 
-def add_activity_column(ws, activity_name):
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    sheet_name = f"Активность {month:02d}.{year}"
+
+    # Проверяем в БД, не создавали ли уже этот лист
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT sheet_name FROM activity_months WHERE year = ? AND month = ?", (year, month))
+    row = cursor.fetchone()
+    if row:
+        # Лист уже создан, пытаемся его получить
+        try:
+            ws = spreadsheet.worksheet(row[0])
+            conn.close()
+            return ws
+        except gspread.WorksheetNotFound:
+            # Лист был удалён вручную, пересоздаём
+            logging.warning(f"Лист {row[0]} не найден, пересоздаём")
+
+    # Создаём копию шаблона
+    new_ws = template.duplicate(insert_sheet_index=0, new_sheet_name=sheet_name)
+    # Сохраняем в БД
+    cursor.execute("INSERT INTO activity_months (year, month, sheet_name) VALUES (?, ?, ?)", (year, month, sheet_name))
+    conn.commit()
+    conn.close()
+    return new_ws
+
+def get_current_activity_sheet():
+    """Основная функция для получения текущего листа активности"""
+    spreadsheet = get_google_spreadsheet()
+    if not spreadsheet:
+        raise Exception("Не удалось подключиться к Google Sheets")
+    return get_or_create_monthly_activity_sheet(spreadsheet)
+
+def find_column_by_header(ws, header_name, start_col=1):
+    """Ищет номер столбца (1-базированный) по заголовку (без учёта регистра и лишних пробелов)"""
     headers = ws.row_values(1)
-    for i, h in enumerate(headers):
-        if i == 0:
-            continue
-        if h.strip() == activity_name:
-            return i + 1
-    col_num = len(headers) + 1
-    if col_num == 1:
-        col_num = 2
-    ws.update_cell(1, col_num, activity_name)
-    return col_num
+    for idx, h in enumerate(headers):
+        if h.strip().lower() == header_name.strip().lower():
+            return idx + 1
+    return None
 
-def mark_activity_for_nicks(ws, activity_name, nicks):
+def mark_activity_in_sheet(ws, activity_column_name, nicks):
+    """Ставит 'БЫЛ' в столбце activity_column_name для всех строк, где ник совпадает"""
+    # Находим столбец с никами
+    nick_col = find_column_by_header(ws, "НИК")
+    if nick_col is None:
+        raise Exception("В листе не найден столбец 'НИК'")
+    # Находим столбец активности
+    act_col = find_column_by_header(ws, activity_column_name)
+    if act_col is None:
+        raise Exception(f"Не найден столбец '{activity_column_name}'")
+
+    # Получаем все значения
     all_values = ws.get_all_values()
-    if not all_values:
-        return 0
-    headers = all_values[0]
-    col_idx = None
-    for i, h in enumerate(headers):
-        if i == 0:
-            continue
-        if h.strip() == activity_name:
-            col_idx = i + 1
-            break
-    if col_idx is None:
-        col_idx = add_activity_column(ws, activity_name)
     updated = 0
     for row_idx, row in enumerate(all_values[1:], start=2):
-        nick_in_sheet = row[0].strip()
-        if nick_in_sheet.lower() in [n.lower() for n in nicks]:
-            ws.update_cell(row_idx, col_idx, "БЫЛ")
+        nick_in_sheet = row[nick_col-1].strip() if len(row) >= nick_col else ''
+        if nick_in_sheet and nick_in_sheet.lower() in [n.lower() for n in nicks]:
+            ws.update_cell(row_idx, act_col, "БЫЛ")
             updated += 1
     return updated
 
 def get_user_activity_count(nick):
-    spreadsheet = get_google_spreadsheet()
-    if not spreadsheet:
-        return 0
-    ws = get_or_create_activity_sheet(spreadsheet)
+    """Возвращает количество 'БЫЛ' для данного ника в текущем листе активности"""
     try:
-        cell = ws.find(nick, in_column=1)
-        if not cell:
+        ws = get_current_activity_sheet()
+        nick_col = find_column_by_header(ws, "НИК")
+        if nick_col is None:
             return 0
-        row_idx = cell.row
-        row_values = ws.row_values(row_idx)
-        count = sum(1 for val in row_values[1:] if val == "БЫЛ")
+        all_values = ws.get_all_values()
+        # Находим все столбцы, где есть "БЫЛ"
+        count = 0
+        for row in all_values[1:]:
+            if row and len(row) >= nick_col and row[nick_col-1].strip().lower() == nick.lower():
+                # Считаем количество "БЫЛ" в строке, начиная с 1-го столбца (можно уточнить)
+                # Для простоты считаем по всем столбцам кроме столбца с ником
+                for col_idx, val in enumerate(row):
+                    if col_idx != nick_col-1 and val == "БЫЛ":
+                        count += 1
+                break
         return count
     except Exception as e:
         logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
         return 0
 
-def get_responses_grouped_by_meeting(poll_id):
-    grouped = {}
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    # Обычные ответы пользователей
-    cursor.execute('''
-        SELECT u.nick, u.class, pr.meeting, pr.answer
-        FROM poll_responses pr
-        JOIN users u ON pr.user_id = u.user_id
-        WHERE pr.poll_id = ?
-    ''', (poll_id,))
-    rows = cursor.fetchall()
-    for nick, user_class, meeting, answer in rows:
-        if meeting not in grouped:
-            grouped[meeting] = []
-        grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
-    # Внешние ответы (админ за другого)
-    cursor.execute('''
-        SELECT external_nick, meeting, answer
-        FROM external_responses
-        WHERE poll_id = ?
-    ''', (poll_id,))
-    ext_rows = cursor.fetchall()
-    for ext_nick, meeting, answer in ext_rows:
-        if meeting not in grouped:
-            grouped[meeting] = []
-        grouped[meeting].append((ext_nick, "Внешний", answer))
-    conn.close()
-    return grouped
-
-def sanitize_sheet_name(name):
-    forbidden = r'[]:*?/\\'
-    for ch in forbidden:
-        name = name.replace(ch, '')
-    if len(name) > 100:
-        name = name[:100]
-    name = name.strip()
-    if not name:
-        name = "Лист"
-    return name
-
-async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
-        await update.message.reply_text("❌ Не заданы переменные GOOGLE_CREDS или GOOGLE_SHEET_ID.")
-        return
-    poll = get_active_poll()
-    if not poll:
-        await update.message.reply_text("Нет активного опроса для экспорта.")
-        return
-    spreadsheet = get_google_spreadsheet()
-    if spreadsheet is None:
-        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
-        return
-    grouped = get_responses_grouped_by_meeting(poll['id'])
-    if not grouped:
-        await update.message.reply_text("Нет ответов на опрос. Экспорт не выполнен.")
-        return
-    headers = ["Ник", "Класс", "Ответ пользователя"]
-    try:
-        for meeting, responses in grouped.items():
-            sheet_name = sanitize_sheet_name(meeting)
-            try:
-                worksheet = spreadsheet.worksheet(sheet_name)
-                worksheet.clear()
-            except gspread.WorksheetNotFound:
-                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
-            data = [headers]
-            for nick, user_class, answer in responses:
-                data.append([nick, user_class, answer])
-            worksheet.update(values=data, range_name='A1')
-        await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(grouped.keys())}")
-    except Exception as e:
-        logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
-        await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
+def get_available_activities(ws):
+    """Возвращает список названий столбцов активностей (исключая столбец 'НИК' и пустые)"""
+    headers = ws.row_values(1)
+    nick_col = find_column_by_header(ws, "НИК")
+    if nick_col is None:
+        return []
+    activities = []
+    for idx, h in enumerate(headers):
+        if idx+1 == nick_col:
+            continue
+        h_clean = h.strip()
+        if h_clean:
+            activities.append(h_clean)
+    return activities
 
 # ---------- КЕШ-ЗАЯВКИ ----------
 def create_cash_order(user_id, nick, photo_file_id):
@@ -752,7 +731,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
 
-# ---------- АКТИВНОСТЬ ИГРОКОВ ----------
+# ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -761,7 +740,7 @@ async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['activity_mode'] = True
     keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     await update.message.reply_text(
-        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность (ГВГ).\n\nДля отмены нажмите «❌ Отмена».",
+        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность (ГВГ/Босс).\n\nДля отмены нажмите «❌ Отмена».",
         reply_markup=keyboard
     )
 
@@ -782,6 +761,7 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
 
+    # Получаем все ники из зарегистрированных пользователей
     users = get_all_users()
     known_nicks = [nick for _, nick, _, _ in users]
 
@@ -802,17 +782,26 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     if unmatched:
         stats += f"Неопознанные: {', '.join(unmatched)}\n\n"
 
-    meetings = get_all_polls_meetings()
-    if not meetings:
-        await update.message.reply_text("Нет созданных опросов (ГВГ). Сначала создайте опрос с встречами.")
+    # Получаем текущий лист активности и список доступных активностей
+    try:
+        ws = get_current_activity_sheet()
+        activities = get_available_activities(ws)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при работе с Google Sheets: {e}")
         context.user_data.pop('activity_mode', None)
         return
+
+    if not activities:
+        await update.message.reply_text("В листе активности не найдено столбцов с активностями (есть только столбец 'НИК'). Проверьте шаблон.")
+        context.user_data.pop('activity_mode', None)
+        return
+
     keyboard = []
-    for m in meetings:
-        keyboard.append([KeyboardButton(m)])
+    for act in activities:
+        keyboard.append([KeyboardButton(act)])
     keyboard.append([KeyboardButton("❌ Отмена")])
     await update.message.reply_text(
-        stats + f"Список для записи: {', '.join(final_nicks)}\n\nВыберите активность (ГВГ):",
+        stats + f"Список для записи: {', '.join(final_nicks)}\n\nВыберите активность:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
     context.user_data['activity_step'] = 'select_activity'
@@ -836,23 +825,28 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_mode', None)
         context.user_data.pop('activity_step', None)
         return
-    spreadsheet = get_google_spreadsheet()
-    if spreadsheet is None:
-        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets. Проверьте настройки.")
-        return
-    ws = get_or_create_activity_sheet(spreadsheet)
-    updated = mark_activity_for_nicks(ws, activity, nicks)
-    all_nicks_in_sheet = [row[0].strip() for row in ws.get_all_values()[1:] if row]
-    all_nicks_in_sheet_lower = [n.lower() for n in all_nicks_in_sheet]
-    not_found = [nick for nick in nicks if nick.lower() not in all_nicks_in_sheet_lower]
-    await update.message.reply_text(
-        f"✅ Готово!\nАктивность: {activity}\nПоставлено плюсов: {updated}\nРаспознано ников: {len(nicks)}"
-        + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
-        reply_markup=get_main_keyboard(user_id)
-    )
-    context.user_data.pop('activity_mode', None)
-    context.user_data.pop('activity_step', None)
-    context.user_data.pop('activity_nicks', None)
+
+    try:
+        ws = get_current_activity_sheet()
+        updated = mark_activity_in_sheet(ws, activity, nicks)
+        # Сообщаем результат
+        all_nicks_in_sheet = []
+        nick_col = find_column_by_header(ws, "НИК")
+        if nick_col:
+            all_vals = ws.get_all_values()
+            all_nicks_in_sheet = [row[nick_col-1].strip() for row in all_vals[1:] if row and len(row) >= nick_col and row[nick_col-1].strip()]
+        not_found = [nick for nick in nicks if nick.lower() not in [n.lower() for n in all_nicks_in_sheet]]
+        await update.message.reply_text(
+            f"✅ Готово!\nАктивность: {activity}\nПоставлено отметок «БЫЛ»: {updated}\nРаспознано ников: {len(nicks)}"
+            + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
+            reply_markup=get_main_keyboard(user_id)
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при записи: {e}")
+    finally:
+        context.user_data.pop('activity_mode', None)
+        context.user_data.pop('activity_step', None)
+        context.user_data.pop('activity_nicks', None)
 
 # ---------- УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ (АДМИН) ----------
 async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -893,19 +887,11 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
     confirmed = confirm_all_pending()
     count = len(confirmed)
 
-    spreadsheet = get_google_spreadsheet()
-    if spreadsheet:
-        ws = get_or_create_activity_sheet(spreadsheet)
-        current_nicks = ws.col_values(1)[1:]
-        current_nicks_lower = [n.strip().lower() for n in current_nicks if n.strip()]
-        added = 0
-        for _, nick, _ in confirmed:
-            if nick.lower() not in current_nicks_lower:
-                row_num = len(current_nicks) + 2 + added
-                ws.update_cell(row_num, 1, nick)
-                added += 1
-        if added:
-            logging.info(f"Добавлено {added} новых ников в лист активности")
+    # Убираем запись в старую таблицу активности (она больше не нужна)
+    # В новой системе ники автоматически берутся из шаблона, который редактируется вручную.
+    # Поэтому после подтверждения регистрации мы ничего не добавляем в Google Sheets.
+    # Администратор должен сам вписать новых игроков в шаблон, чтобы они появились в активности.
+    # При желании можно добавить автоматическое добавление, но по условию задачи – не требуется.
 
     active_poll = get_active_poll()
     if active_poll:
@@ -932,7 +918,6 @@ async def create_boss_announcement(boss_name, day_of_week, time_str):
     await send_announcement_to_all(text)
 
 def schedule_boss_announcements(scheduler):
-    # Комендант – среда, 10:00
     scheduler.add_job(
         create_boss_announcement,
         'cron',
@@ -942,7 +927,6 @@ def schedule_boss_announcements(scheduler):
         args=("Комендант", "среду", "20:45"),
         id="komendant_announce"
     )
-    # Баньши – воскресенье, 10:00
     scheduler.add_job(
         create_boss_announcement,
         'cron',
@@ -993,12 +977,11 @@ async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Активный опрос исчез. Попробуйте позже.")
         return
     data['poll_id'] = poll['id']
-    data['poll_text'] = poll['text']      # <-- сохраняем текст опроса
+    data['poll_text'] = poll['text']
     data['meetings'] = poll['meetings']
     data['current_index'] = 0
     data['answers'] = {}
     data['step'] = 'polling'
-    # Отправляем первый вопрос
     await send_admin_poll_question(update, context, user_id)
 
 async def send_admin_poll_question(update, context, user_id):
@@ -1031,7 +1014,7 @@ async def send_admin_poll_question(update, context, user_id):
     ])
     text = f"📢 *Опрос за другого*\n\n{poll_text}\n\nВопрос {idx+1} из {len(meetings)}:\n{meeting}\n\nВаш ответ:"
     await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
-    
+
 async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1157,7 +1140,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ручной опрос отменён.", reply_markup=get_main_keyboard(user_id))
             return
 
-    # ========== РУЧНОЙ ОПРОС АДМИНОМ (ввод ника) – ДО ВСЕГО ОСТАЛЬНОГО ==========
+    # Ручной опрос админом (ввод ника)
     if context.user_data.get('admin_poll') and context.user_data['admin_poll'].get('step') == 'awaiting_nick':
         await admin_poll_nick_received(update, context)
         return
@@ -1172,10 +1155,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_activity_choice(update, context)
         return
 
-    # Заказ кеша: описание
-    if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'description':
-        await handle_cash_order_description(update, context)
-        return
+    # Заказ кеша: описание (здесь не используется, так как мы убрали описание, но оставим для совместимости)
+    # if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'description':
+    #     await handle_cash_order_description(update, context)
+    #     return
 
     # Регистрация: ник
     if context.user_data.get('awaiting_nick'):
@@ -1221,7 +1204,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Основное меню (всё остальное)
+    # Основное меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1238,8 +1221,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📊 *Ваша активность*\n\n"
             f"┌ Всего отметок «БЫЛ»: *{activity_count}*\n"
-            f"└ (за всё время)\n\n"
-            f"💡 *Совет:* больше участвуйте в ГВГ, чтобы увеличить счёт!",
+            f"└ (за текущий месяц)\n\n"
+            f"💡 *Совет:* больше участвуйте в ГВГ и боссах!",
             parse_mode="Markdown"
         )
     elif text == "📝 Мои ответы":
@@ -1572,6 +1555,7 @@ async def post_init(app: Application):
     logging.info("Планировщик объявлений запущен")
 
 def main():
+    global app
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
     app.post_init = post_init
