@@ -538,6 +538,75 @@ def get_available_activities(ws):
             activities.append(h_clean)
     return activities
 
+# ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
+def get_responses_grouped_by_meeting(poll_id):
+    grouped = {}
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Обычные ответы пользователей
+    cursor.execute('''
+        SELECT u.nick, u.class, pr.meeting, pr.answer
+        FROM poll_responses pr
+        JOIN users u ON pr.user_id = u.user_id
+        WHERE pr.poll_id = ?
+    ''', (poll_id,))
+    rows = cursor.fetchall()
+    for nick, user_class, meeting, answer in rows:
+        if meeting not in grouped:
+            grouped[meeting] = []
+        grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
+    # Внешние ответы (админ за другого)
+    cursor.execute('''
+        SELECT external_nick, meeting, answer
+        FROM external_responses
+        WHERE poll_id = ?
+    ''', (poll_id,))
+    ext_rows = cursor.fetchall()
+    for ext_nick, meeting, answer in ext_rows:
+        if meeting not in grouped:
+            grouped[meeting] = []
+        grouped[meeting].append((ext_nick, "Внешний", answer))
+    conn.close()
+    return grouped
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        await update.message.reply_text("❌ Не заданы переменные GOOGLE_CREDS или GOOGLE_SHEET_ID.")
+        return
+    poll = get_active_poll()
+    if not poll:
+        await update.message.reply_text("Нет активного опроса для экспорта.")
+        return
+    spreadsheet = get_google_spreadsheet()
+    if spreadsheet is None:
+        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
+        return
+    grouped = get_responses_grouped_by_meeting(poll['id'])
+    if not grouped:
+        await update.message.reply_text("Нет ответов на опрос. Экспорт не выполнен.")
+        return
+    headers = ["Ник", "Класс", "Ответ пользователя"]
+    try:
+        for meeting, responses in grouped.items():
+            sheet_name = sanitize_sheet_name(meeting)
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+                worksheet.clear()
+            except gspread.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
+            data = [headers]
+            for nick, user_class, answer in responses:
+                data.append([nick, user_class, answer])
+            worksheet.update(values=data, range_name='A1')
+        await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(grouped.keys())}")
+    except Exception as e:
+        logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
+
 # ---------- КЕШ-ЗАЯВКИ ----------
 def create_cash_order(user_id, nick, photo_file_id):
     conn = sqlite3.connect(DB_FILE)
@@ -1545,6 +1614,73 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_cash_order_photo(update, context)
         return
     await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
+def get_responses_grouped_by_meeting(poll_id):
+    grouped = {}
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Обычные ответы пользователей
+    cursor.execute('''
+        SELECT u.nick, u.class, pr.meeting, pr.answer
+        FROM poll_responses pr
+        JOIN users u ON pr.user_id = u.user_id
+        WHERE pr.poll_id = ?
+    ''', (poll_id,))
+    rows = cursor.fetchall()
+    for nick, user_class, meeting, answer in rows:
+        if meeting not in grouped:
+            grouped[meeting] = []
+        grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
+    # Внешние ответы (админ за другого)
+    cursor.execute('''
+        SELECT external_nick, meeting, answer
+        FROM external_responses
+        WHERE poll_id = ?
+    ''', (poll_id,))
+    ext_rows = cursor.fetchall()
+    for ext_nick, meeting, answer in ext_rows:
+        if meeting not in grouped:
+            grouped[meeting] = []
+        grouped[meeting].append((ext_nick, "Внешний", answer))
+    conn.close()
+    return grouped
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        await update.message.reply_text("❌ Не заданы переменные GOOGLE_CREDS или GOOGLE_SHEET_ID.")
+        return
+    poll = get_active_poll()
+    if not poll:
+        await update.message.reply_text("Нет активного опроса для экспорта.")
+        return
+    spreadsheet = get_google_spreadsheet()
+    if spreadsheet is None:
+        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
+        return
+    grouped = get_responses_grouped_by_meeting(poll['id'])
+    if not grouped:
+        await update.message.reply_text("Нет ответов на опрос. Экспорт не выполнен.")
+        return
+    headers = ["Ник", "Класс", "Ответ пользователя"]
+    try:
+        for meeting, responses in grouped.items():
+            sheet_name = sanitize_sheet_name(meeting)
+            try:
+                worksheet = spreadsheet.worksheet(sheet_name)
+                worksheet.clear()
+            except gspread.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
+            data = [headers]
+            for nick, user_class, answer in responses:
+                data.append([nick, user_class, answer])
+            worksheet.update(values=data, range_name='A1')
+        await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(grouped.keys())}")
+    except Exception as e:
+        logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
+        await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
 
 # ---------- ЗАПУСК ----------
 async def post_init(app: Application):
