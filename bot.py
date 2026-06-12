@@ -956,7 +956,6 @@ def schedule_boss_announcements(scheduler):
 
 # ---------- РУЧНОЙ ОПРОС АДМИНОМ ЗА ДРУГОГО ----------
 async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает процесс: ввод ника, затем опрос"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
@@ -973,7 +972,6 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получили ник, начинаем опрос"""
     user_id = update.effective_user.id
     if not is_admin(user_id) or 'admin_poll' not in context.user_data:
         return
@@ -995,11 +993,12 @@ async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Активный опрос исчез. Попробуйте позже.")
         return
     data['poll_id'] = poll['id']
-    data['poll_text'] = poll['text']
+    data['poll_text'] = poll['text']      # <-- сохраняем текст опроса
     data['meetings'] = poll['meetings']
     data['current_index'] = 0
     data['answers'] = {}
     data['step'] = 'polling'
+    # Отправляем первый вопрос
     await send_admin_poll_question(update, context, user_id)
 
 async def send_admin_poll_question(update, context, user_id):
@@ -1008,8 +1007,8 @@ async def send_admin_poll_question(update, context, user_id):
         return
     idx = data['current_index']
     meetings = data['meetings']
+    poll_text = data['poll_text']
     if idx >= len(meetings):
-        # сводка
         answers = data['answers']
         summary = "✅ *Ваши ответы:*\n\n"
         for m in meetings:
@@ -1030,8 +1029,9 @@ async def send_admin_poll_question(update, context, user_id):
             InlineKeyboardButton("❓ Не знаю", callback_data=f"admin_poll_ans_не знаю")
         ]
     ])
-    text = f"📢 *Опрос за другого*\n\n{poll['text']}\n\nВопрос {idx+1} из {len(meetings)}:\n{meeting}\n\nВаш ответ:"
+    text = f"📢 *Опрос за другого*\n\n{poll_text}\n\nВопрос {idx+1} из {len(meetings)}:\n{meeting}\n\nВаш ответ:"
     await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
+    
 async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1049,7 +1049,6 @@ async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text(f"✅ Ответ на '{meeting}' сохранён. Следующий вопрос...")
         await send_admin_poll_question(update, context, user_id)
     elif data == "admin_poll_save":
-        # Сохраняем все ответы в external_responses
         poll_id = poll_data['poll_id']
         external_nick = poll_data['external_nick']
         admin_id = user_id
@@ -1058,7 +1057,6 @@ async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             save_external_response(poll_id, external_nick, meeting, ans, admin_id)
         del context.user_data['admin_poll']
         await query.edit_message_text(f"✅ Ответы для пользователя {external_nick} сохранены! Они будут учтены в результатах опроса.")
-        # Вернуть админа в подменю опросов
         await context.bot.send_message(chat_id=user_id, text="Управление опросами:", reply_markup=get_polls_management_keyboard())
     elif data == "admin_poll_cancel":
         del context.user_data['admin_poll']
