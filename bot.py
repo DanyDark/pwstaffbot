@@ -1336,13 +1336,64 @@ async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     keyboard = [
-        [KeyboardButton("👤 Мой профиль")],
+        [KeyboardButton("👤 Мой профиль"), KeyboardButton("💰 Моя ЗП")],
         [KeyboardButton("📊 Моя активность"), KeyboardButton("📝 Мои ответы")],
         [KeyboardButton("❓ Помощь"), KeyboardButton("💰 Заказ кеша")]
     ]
     if is_admin(user_id):
         keyboard.append([KeyboardButton("📊 Админ-панель")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_user_valid(user_id):
+        await update.message.reply_text("Вы не зарегистрированы. Нажмите /start.")
+        return
+
+    nick = get_user_nick(user_id)
+    if not nick:
+        await update.message.reply_text("Не удалось определить ваш ник.")
+        return
+
+    try:
+        ws = get_current_activity_sheet()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
+        return
+
+    nick_col = find_column_by_header(ws, "НИК")
+    if nick_col is None:
+        await update.message.reply_text("❌ В листе не найден столбец 'НИК'.")
+        return
+
+    all_values = ws.get_all_values()
+    total_salary = 0
+
+    for row_idx, row in enumerate(all_values[1:], start=2):
+        current_nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
+        if current_nick.lower() != nick.lower():
+            continue
+
+        # Считаем ЗП по активностям (только в диапазонах ACTIVITY_COLUMNS)
+        for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
+            for col in range(start_col, end_col+1):
+                if len(row) >= col:
+                    cell_value = row[col-1].strip()
+                    if cell_value == "БЫЛ":
+                        total_salary += 10_000_000
+                    elif cell_value == "БЫЛ ПЛ":
+                        total_salary += 20_000_000
+        break  # нашли пользователя, дальше не ищем
+
+    # Переводим в чеки (1 чек = 10_000_000)
+    checks = total_salary // 10_000_000
+    await update.message.reply_text(
+        f"💰 *Ваша зарплата за текущий месяц*\n\n"
+        f"Сумма: {total_salary:,} (в игровой валюте)\n"
+        f"Это составляет: *{checks} чеков*\n\n"
+        f"1 чек = 10 000 000",
+        parse_mode="Markdown"
+    )
 
 def get_admin_keyboard():
     keyboard = [
@@ -1478,6 +1529,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif text == "💰 Расчет ЗП" and is_admin(user_id):
         await calculate_salaries(update, context)
+        return
+        
+    elif text == "💰 Моя ЗП":
+        await my_salary(update, context)
+        return
 
     # ---------- РЕГИСТРАЦИЯ ----------
     # Регистрация: ник
@@ -1905,6 +1961,7 @@ def main():
     app.add_handler(CommandHandler("edit_class", edit_class_command))
     app.add_handler(CallbackQueryHandler(show_all_ids_callback, pattern="^show_all_ids$"))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CommandHandler("mysalary", my_salary))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_"))
