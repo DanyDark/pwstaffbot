@@ -540,6 +540,54 @@ def get_user_activity_count(nick):
     except Exception as e:
         logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
         return 0
+async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+
+    try:
+        ws = get_current_activity_sheet()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
+        return
+
+    # Находим столбцы
+    nick_col = find_column_by_header(ws, "НИК")
+    salary_col = find_column_by_header(ws, "Общая ЗП")
+    if nick_col is None or salary_col is None:
+        await update.message.reply_text("❌ В листе не найдены столбцы 'НИК' или 'Общая ЗП'.")
+        return
+
+    # Получаем все значения
+    all_values = ws.get_all_values()
+    if len(all_values) < 2:
+        await update.message.reply_text("Нет данных для расчета.")
+        return
+
+    updated_rows = 0
+    # Проходим по строкам, начиная со второй (первая - заголовки)
+    for row_idx, row in enumerate(all_values[1:], start=2):
+        nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
+        if not nick:
+            continue
+
+        total_salary = 0
+        # Проверяем ячейки только в диапазонах активностей (Комендант, Баньши, ГВГ)
+        for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
+            for col in range(start_col, end_col+1):
+                if len(row) >= col:
+                    cell_value = row[col-1].strip()
+                    if cell_value == "БЫЛ":
+                        total_salary += 10_000_000
+                    elif cell_value == "БЫЛ ПЛ":
+                        total_salary += 20_000_000
+
+        # Обновляем ячейку ЗП
+        ws.update_cell(row_idx, salary_col, total_salary)
+        updated_rows += 1
+
+    await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
 
 # ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
 def get_responses_grouped_by_meeting(poll_id):
@@ -1316,10 +1364,10 @@ def get_clan_management_keyboard():
     keyboard = [
         [KeyboardButton("👥 Список пользователей")],
         [KeyboardButton("✏️ Исправить профиль"), KeyboardButton("📊 Активность игроков")],
-        [KeyboardButton("📝 Регистрация"), KeyboardButton("🔙 Назад")]
+        [KeyboardButton("💰 Расчет ЗП"), KeyboardButton("📝 Регистрация")],
+        [KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
 
 async def edit_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1427,6 +1475,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
         return
+        
+    elif text == "💰 Расчет ЗП" and is_admin(user_id):
+        await calculate_salaries(update, context)
 
     # ---------- РЕГИСТРАЦИЯ ----------
     # Регистрация: ник
@@ -1864,7 +1915,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
-
+    app.add_handler(CommandHandler("calc_salary", calculate_salaries))
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
 
