@@ -1212,7 +1212,7 @@ def schedule_boss_announcements(scheduler):
         hour=11,
         minute=0,
         args=("Комендант", "среду", "20:45"),
-        id="komendant_announce"
+        id="komendant_announce",
         timezone='Europe/Moscow'
     )
     scheduler.add_job(
@@ -1221,8 +1221,8 @@ def schedule_boss_announcements(scheduler):
         day_of_week='sun',
         hour=11,
         minute=0,
-        args=("Баньши", "воскресенье", "14:30"),
-        id="banyshi_announce"
+        args=("Баньши", "воскресенье", "15:40"),
+        id="banyshi_announce",
         timezone='Europe/Moscow'
     )
     logging.info("Планировщик объявлений о боссах запущен")
