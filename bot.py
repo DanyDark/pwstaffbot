@@ -1209,19 +1209,21 @@ def schedule_boss_announcements(scheduler):
         create_boss_announcement,
         'cron',
         day_of_week='wed',
-        hour=10,
+        hour=11,
         minute=0,
         args=("Комендант", "среду", "20:45"),
         id="komendant_announce"
+        timezone='Europe/Moscow'
     )
     scheduler.add_job(
         create_boss_announcement,
         'cron',
         day_of_week='sun',
-        hour=10,
+        hour=11,
         minute=0,
         args=("Баньши", "воскресенье", "14:30"),
         id="banyshi_announce"
+        timezone='Europe/Moscow'
     )
     logging.info("Планировщик объявлений о боссах запущен")
 
@@ -1939,7 +1941,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ЗАПУСК ----------
 async def post_init(app: Application):
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone='Europe/Moscow')
     schedule_boss_announcements(scheduler)
     scheduler.start()
     app.bot_data['scheduler'] = scheduler
