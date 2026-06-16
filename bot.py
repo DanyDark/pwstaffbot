@@ -1503,11 +1503,14 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(user_id) or context.user_data.get('admin_poll_step') != 'awaiting_input':
         return
     text = update.message.text.strip()
+    
+    # ОБРАБОТКА ОТМЕНЫ
     if text == "❌ Отмена":
         context.user_data.pop('admin_poll_step', None)
         context.user_data.pop('admin_poll_data', None)
         await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
         return
+    
     parts = [part.strip() for part in text.split('\\')]
     if len(parts) < 3:
         await update.message.reply_text("❌ Неверный формат. Ожидается: НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 ...")
