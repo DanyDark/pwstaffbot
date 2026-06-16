@@ -714,6 +714,95 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Однако мы не удаляем строки, поэтому оставляем как есть – они будут пустыми.
 
     await update.message.reply_text(f"✅ Синхронизация завершена.\nОбновлено ников: {total_updated}")
+    
+def sync_pa_internal():
+    """Внутренняя синхронизация шаблона (без отправки сообщений в чат)"""
+    users = get_all_users()
+    if not users:
+        return
+
+    class_mapping = {
+        "ВАР": "ВАРЫ",
+        "МАГ": "МАГИ",
+        "ДРУ": "ДРУЛИ",
+        "ТАНК": "ТАНКИ",
+        "ЛУК": "ЛУЧНИКИ",
+        "ПРИСТ": "ПРИСТЫ",
+        "СИН": "СИНЫ",
+        "ШАМ": "ШАМЫ",
+        "СИК": "СТРАЖИ",
+        "МИСТИК": "МИСТИКИ"
+    }
+    section_order = ["ВАРЫ", "МАГИ", "ДРУЛИ", "ТАНКИ", "ЛУЧНИКИ", "ПРИСТЫ", "СИНЫ", "ШАМЫ", "СТРАЖИ", "МИСТИКИ"]
+
+    grouped = {section: [] for section in section_order}
+    for uid, nick, user_class, _ in users:
+        section = class_mapping.get(user_class.upper())
+        if section:
+            grouped[section].append(nick)
+        else:
+            logging.warning(f"Неизвестный класс: {user_class}")
+
+    for section in grouped:
+        grouped[section].sort()
+
+    spreadsheet = get_google_spreadsheet()
+    if not spreadsheet:
+        logging.error("Не удалось подключиться к Google Sheets для синхронизации шаблона")
+        return
+    try:
+        ws = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
+    except gspread.WorksheetNotFound:
+        logging.error("Лист 'ШАБЛОН АКТИВНОСТИ' не найден")
+        return
+
+    all_values = ws.get_all_values()
+    header_rows = {}
+    for idx, row in enumerate(all_values, start=1):
+        if len(row) >= 2:
+            cell_value = row[1].strip()
+            if cell_value in section_order:
+                header_rows[cell_value] = idx
+
+    missing_sections = [s for s in section_order if s not in header_rows]
+    if missing_sections:
+        logging.warning(f"В шаблоне не найдены разделы: {', '.join(missing_sections)}")
+        return
+
+    total_updated = 0
+    for idx, section in enumerate(section_order):
+        header_row = header_rows[section]
+        next_header_row = header_rows.get(section_order[idx+1]) if idx+1 < len(section_order) else None
+
+        if next_header_row:
+            available_rows = next_header_row - header_row - 1
+        else:
+            available_rows = len(all_values) - header_row
+
+        nicks = grouped.get(section, [])
+        needed_rows = len(nicks)
+
+        if needed_rows > available_rows:
+            rows_to_insert = needed_rows - available_rows
+            if next_header_row:
+                insert_index = next_header_row
+            else:
+                insert_index = len(all_values) + 1
+            for _ in range(rows_to_insert):
+                ws.insert_rows(insert_index, amount=1)
+            # Перечитываем лист, чтобы обновить индексы для следующих разделов
+            all_values = ws.get_all_values()
+            for s in section_order[idx+1:]:
+                if s in header_rows:
+                    header_rows[s] += rows_to_insert
+
+        start_row = header_row + 1
+        for i, nick in enumerate(nicks):
+            ws.update_cell(start_row + i, 2, nick)
+            total_updated += 1
+
+    logging.info(f"Синхронизация шаблона завершена. Обновлено ников: {total_updated}")
+    return total_updated
 
 # ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
 def get_responses_grouped_by_meeting(poll_id):
@@ -790,6 +879,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for nick, user_class, answer in responses:
                 data.append([nick, user_class, answer])
             worksheet.update(values=data, range_name='A1')
+            sort_sheet_by_class(worksheet)
         await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(grouped.keys())}")
     except Exception as e:
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
@@ -1052,6 +1142,26 @@ async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность.\n\nДоступные активности: Комендант, Баньши, ГВГ.\n\nДля отмены нажмите «❌ Отмена».",
         reply_markup=keyboard
     )
+    
+def sort_sheet_by_class(worksheet):
+    """Сортирует лист по столбцу 'Класс' (столбец B) от А до Я, сохраняя заголовок"""
+    all_values = worksheet.get_all_values()
+    if len(all_values) < 2:
+        return
+
+    headers = all_values[0]
+    data = all_values[1:]
+    # Проверяем, что столбец B есть
+    if len(headers) < 2:
+        return
+    # Сортируем по столбцу B (класс)
+    data_sorted = sorted(data, key=lambda row: row[1].strip() if len(row) > 1 else "")
+    # Объединяем заголовки и отсортированные данные
+    new_values = [headers] + data_sorted
+    # Очищаем лист и записываем отсортированные данные
+    worksheet.clear()
+    if new_values:
+        worksheet.update(values=new_values, range_name='A1')
 
 async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('activity_mode'):
@@ -1297,7 +1407,7 @@ async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYP
             msg = ""
     if msg:
         await update.message.reply_text(msg, parse_mode="Markdown")
-
+        
 async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1315,7 +1425,14 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
             except Exception as e:
                 logging.error(f"Не удалось отправить опрос пользователю {uid}: {e}")
 
+    # Автоматическая синхронизация шаблона
+    try:
+        sync_pa_internal()
+    except Exception as e:
+        logging.error(f"Ошибка при синхронизации шаблона: {e}")
+
     await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
+
 
 # ---------- ПЛАНИРОВЩИК ОБЪЯВЛЕНИЙ (БОССЫ) ----------
 async def send_announcement_to_all(text):
