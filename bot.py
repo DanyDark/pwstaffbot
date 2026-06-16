@@ -489,9 +489,9 @@ def find_nick_column(ws):
 
 # Конфигурация активностей: название -> (start_col, end_col) 1-базированные
 ACTIVITY_COLUMNS = {
-    "Комендант": (4, 8),   # D-H
-    "Баньши": (9, 12),     # I-L
-    "ГВГ": (13, 16)        # M-P
+    "Комендант": (3, 7),   # C-G
+    "Баньши": (8, 11),     # H-K
+    "ГВГ": (12, 15)        # L-O
 }
 
 def get_available_activities(ws):
@@ -548,6 +548,7 @@ def get_user_activity_count(nick):
     except Exception as e:
         logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
         return 0
+        
 async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -560,28 +561,24 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
         return
 
-    # Находим столбцы
     nick_col = find_column_by_header(ws, "НИК")
     salary_col = find_column_by_header(ws, "Общая ЗП")
     if nick_col is None or salary_col is None:
         await update.message.reply_text("❌ В листе не найдены столбцы 'НИК' или 'Общая ЗП'.")
         return
 
-    # Получаем все значения
     all_values = ws.get_all_values()
     if len(all_values) < 2:
         await update.message.reply_text("Нет данных для расчета.")
         return
 
     updated_rows = 0
-    # Проходим по строкам, начиная со второй (первая - заголовки)
     for row_idx, row in enumerate(all_values[1:], start=2):
         nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
         if not nick:
             continue
 
         total_salary = 0
-        # Проверяем ячейки только в диапазонах активностей (Комендант, Баньши, ГВГ)
         for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
             for col in range(start_col, end_col+1):
                 if len(row) >= col:
@@ -591,11 +588,10 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     elif cell_value == "БЫЛ ПЛ":
                         total_salary += 20_000_000
 
-        # Обновляем ячейку ЗП
         ws.update_cell(row_idx, salary_col, total_salary)
         updated_rows += 1
 
-        await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
+    await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
 
 async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
