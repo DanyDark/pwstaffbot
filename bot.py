@@ -1762,12 +1762,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('edit_class_user_id', None)
             await update.message.reply_text("Редактирование класса отменено.", reply_markup=get_main_keyboard(user_id))
             return
-        if context.user_data.get('edit_nick_mode'):
-            context.user_data.pop('edit_nick_mode', None)
-            context.user_data.pop('edit_old_nick', None)
-            context.user_data.pop('edit_target_user_id', None)
-            await update.message.reply_text("Редактирование ника отменено.", reply_markup=get_main_keyboard(user_id))
-            return
         if context.user_data.get('poll_creation'):
             del context.user_data['poll_creation']
             await update.message.reply_text("Создание опроса отменено.", reply_markup=get_polls_management_keyboard())
@@ -1790,43 +1784,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('reject_mode', None)
             await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
             return
-
-    # ---------- СПЕЦИАЛЬНЫЕ РЕЖИМЫ ----------
-    # Ручной опрос админом (ввод ника)
-    if context.user_data.get('admin_poll') and context.user_data['admin_poll'].get('step') == 'awaiting_nick':
-        await admin_poll_nick_received(update, context)
+        # Если ничего не подошло – просто игнорируем
         return
 
-    # Редактирование класса
+    # ====== РУЧНОЙ ОПРОС АДМИНОМ (ввод данных) ======
+    # Эта проверка должна быть ДО всех остальных!
+    if context.user_data.get('admin_poll'):
+        await handle_admin_poll_text(update, context)
+        return
+
+    # ---------- РЕДАКТИРОВАНИЕ КЛАССА ----------
     if context.user_data.get('edit_class_mode'):
         await handle_edit_class(update, context)
         return
 
-    # Редактирование ника
-    if context.user_data.get('edit_nick_mode'):
-        await handle_edit_nick(update, context)
-        return
-
-    # Отказ от заявок (режим выбора пользователя)
-    if context.user_data.get('reject_mode'):
-        await handle_reject_pending(update, context)
-        return
-
-    # Выбор активности после распознавания
+    # ---------- ВЫБОР АКТИВНОСТИ ----------
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
         return
-        
-    elif text == "💰 Расчет ЗП" and is_admin(user_id):
-        await calculate_salaries(update, context)
-        return
-        
-    elif text == "💰 Моя ЗП":
-        await my_salary(update, context)
-        return
 
-    # ---------- РЕГИСТРАЦИЯ ----------
-    # Регистрация: ник
+    # ---------- РЕГИСТРАЦИЯ: НИК ----------
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
         if is_nick_taken(nick):
@@ -1838,7 +1815,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Отлично! Теперь выберите класс вашего персонажа:", reply_markup=get_class_keyboard())
         return
 
-    # Регистрация: класс (отправляем заявку)
+    # ---------- РЕГИСТРАЦИЯ: КЛАСС ----------
     if context.user_data.get('awaiting_class'):
         valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         if text in valid_classes:
@@ -1869,6 +1846,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Вы не зарегистрированы. Нажмите /start для регистрации."
         )
         return
+
+    # ---------- ОСНОВНОЕ МЕНЮ ----------
+    # ... (весь остальной код с кнопками и командами)
 
     # ---------- ОСНОВНОЕ МЕНЮ ----------
     if text == "👤 Мой профиль":
