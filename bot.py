@@ -96,17 +96,25 @@ def init_db():
             requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Таблица для внешних ответов (админ за другого)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS external_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             poll_id INTEGER,
             external_nick TEXT,
+            external_class TEXT,
             meeting TEXT,
             answer TEXT,
             admin_id INTEGER,
             responded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # Добавляем поле external_class, если его нет (миграция)
+    cursor.execute("PRAGMA table_info(external_responses)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'external_class' not in columns:
+        cursor.execute("ALTER TABLE external_responses ADD COLUMN external_class TEXT")
+    # Таблица для учёта созданных месячных листов активности
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS activity_months (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,13 +291,13 @@ def save_responses(user_id, poll_id, responses_dict):
     conn.commit()
     conn.close()
 
-def save_external_response(poll_id, external_nick, meeting, answer, admin_id):
+def save_external_response(poll_id, external_nick, external_class, meeting, answer, admin_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO external_responses (poll_id, external_nick, meeting, answer, admin_id)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (poll_id, external_nick, meeting, answer, admin_id))
+        INSERT INTO external_responses (poll_id, external_nick, external_class, meeting, answer, admin_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (poll_id, external_nick, external_class, meeting, answer, admin_id))
     conn.commit()
     conn.close()
 
@@ -823,15 +831,15 @@ def get_responses_grouped_by_meeting(poll_id):
         grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
     # Внешние ответы (админ за другого)
     cursor.execute('''
-        SELECT external_nick, meeting, answer
+        SELECT external_nick, external_class, meeting, answer
         FROM external_responses
         WHERE poll_id = ?
     ''', (poll_id,))
     ext_rows = cursor.fetchall()
-    for ext_nick, meeting, answer in ext_rows:
+    for ext_nick, ext_class, meeting, answer in ext_rows:
         if meeting not in grouped:
             grouped[meeting] = []
-        grouped[meeting].append((ext_nick, "Внешний", answer))
+        grouped[meeting].append((ext_nick, ext_class if ext_class else "Внешний", answer))
     conn.close()
     return grouped
     
@@ -1480,11 +1488,50 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
     if not poll:
         await update.message.reply_text("Нет активного опроса.")
         return
-    context.user_data['admin_poll'] = {'step': 'awaiting_nick'}
+    context.user_data['admin_poll'] = {'poll_id': poll['id'], 'meetings': poll['meetings']}
     keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     await update.message.reply_text(
-        "Введите ник игрока, за которого хотите пройти опрос.\n(Ник может быть любым, даже не зарегистрированным в боте)",
+        "Введите данные для прохождения опроса за другого игрока в формате:\n\n"
+        "`НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 \\ ОТВЕТ_3 ...`\n\n"
+        f"Количество ответов должно быть равно количеству встреч в опросе ({len(poll['meetings'])}):\n"
+        f"{', '.join(poll['meetings'])}\n\n"
+        "Пример: `Qudas \\ СИН \\ Да \\ Нет \\ Не знаю`\n\n"
+        "Для отмены нажмите «❌ Отмена».",
+        parse_mode="Markdown",
         reply_markup=keyboard
+    )
+async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id) or 'admin_poll' not in context.user_data:
+        return
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        del context.user_data['admin_poll']
+        await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
+        return
+    parts = [part.strip() for part in text.split('\\')]
+    if len(parts) < 3:
+        await update.message.reply_text("❌ Неверный формат. Ожидается: НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 ...")
+        return
+    nick = parts[0]
+    user_class = parts[1]
+    answers = parts[2:]
+    poll_data = context.user_data['admin_poll']
+    meetings = poll_data['meetings']
+    if len(answers) != len(meetings):
+        await update.message.reply_text(
+            f"❌ Количество ответов ({len(answers)}) не совпадает с количеством встреч ({len(meetings)}).\n"
+            f"Ожидается: {len(meetings)} ответов."
+        )
+        return
+    poll_id = poll_data['poll_id']
+    for meeting, answer in zip(meetings, answers):
+        save_external_response(poll_id, nick, user_class, meeting, answer, user_id)
+    del context.user_data['admin_poll']
+    await update.message.reply_text(
+        f"✅ Ответы для {nick} (класс: {user_class}) сохранены!\n"
+        f"Встречи и ответы:\n" + "\n".join([f"• {m}: {a}" for m, a in zip(meetings, answers)]),
+        reply_markup=get_main_keyboard(user_id)
     )
 
 async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1518,7 +1565,9 @@ async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT
 
 async def send_admin_poll_question(update, context, user_id):
     data = context.user_data.get('admin_poll')
-    if not data:
+        # Ручной опрос админом (ввод данных)
+    if context.user_data.get('admin_poll'):
+        await handle_admin_poll_text(update, context)
         return
     idx = data['current_index']
     meetings = data['meetings']
@@ -2213,7 +2262,6 @@ def main():
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
     app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
-    app.add_handler(CallbackQueryHandler(admin_poll_callback, pattern="^admin_poll_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
