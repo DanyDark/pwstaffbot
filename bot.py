@@ -1484,7 +1484,8 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
     if not poll:
         await update.message.reply_text("Нет активного опроса.")
         return
-    context.user_data['admin_poll'] = {'poll_id': poll['id'], 'meetings': poll['meetings']}
+    context.user_data['admin_poll_step'] = 'awaiting_input'
+    context.user_data['admin_poll_data'] = {'poll_id': poll['id'], 'meetings': poll['meetings']}
     keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     await update.message.reply_text(
         "Введите данные для прохождения опроса за другого игрока в формате:\n\n"
@@ -1496,13 +1497,15 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
         reply_markup=keyboard
     )
+    
 async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id) or 'admin_poll' not in context.user_data:
+    if not is_admin(user_id) or context.user_data.get('admin_poll_step') != 'awaiting_input':
         return
     text = update.message.text.strip()
     if text == "❌ Отмена":
-        del context.user_data['admin_poll']
+        context.user_data.pop('admin_poll_step', None)
+        context.user_data.pop('admin_poll_data', None)
         await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
         return
     parts = [part.strip() for part in text.split('\\')]
@@ -1512,7 +1515,10 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
     nick = parts[0]
     user_class = parts[1]
     answers = parts[2:]
-    poll_data = context.user_data['admin_poll']
+    poll_data = context.user_data.get('admin_poll_data')
+    if not poll_data:
+        await update.message.reply_text("❌ Нет данных об опросе. Начните заново.")
+        return
     meetings = poll_data['meetings']
     if len(answers) != len(meetings):
         await update.message.reply_text(
@@ -1523,11 +1529,11 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
     poll_id = poll_data['poll_id']
     for meeting, answer in zip(meetings, answers):
         save_external_response(poll_id, nick, user_class, meeting, answer, user_id)
-    del context.user_data['admin_poll']
+    # НЕ удаляем состояние, чтобы можно было ввести следующую строку
     await update.message.reply_text(
         f"✅ Ответы для {nick} (класс: {user_class}) сохранены!\n"
         f"Встречи и ответы:\n" + "\n".join([f"• {m}: {a}" for m, a in zip(meetings, answers)]),
-        reply_markup=get_main_keyboard(user_id)
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
 
 async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1789,7 +1795,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ====== РУЧНОЙ ОПРОС АДМИНОМ (ввод данных) ======
     # Эта проверка должна быть ДО всех остальных!
-    if context.user_data.get('admin_poll'):
+    if context.user_data.get('admin_poll_step') == 'awaiting_input':
         await handle_admin_poll_text(update, context)
         return
 
