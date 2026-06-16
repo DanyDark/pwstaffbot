@@ -587,7 +587,132 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ws.update_cell(row_idx, salary_col, total_salary)
         updated_rows += 1
 
-    await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
+await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
+    async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+
+    # 1. Получаем всех пользователей из БД
+    users = get_all_users()
+    if not users:
+        await update.message.reply_text("Нет зарегистрированных пользователей.")
+        return
+
+    # 2. Маппинг классов из БД в названия разделов в шаблоне
+    class_mapping = {
+        "ВАР": "ВАРЫ",
+        "МАГ": "МАГИ",
+        "ДРУ": "ДРУЛИ",
+        "ТАНК": "ТАНКИ",
+        "ЛУК": "ЛУЧНИКИ",
+        "ПРИСТ": "ПРИСТЫ",
+        "СИН": "СИНЫ",
+        "ШАМ": "ШАМЫ",
+        "СИК": "СТРАЖИ",
+        "МИСТИК": "МИСТИКИ"
+    }
+    # Порядок разделов в шаблоне (как они идут сверху вниз)
+    section_order = ["ВАРЫ", "МАГИ", "ДРУЛИ", "ТАНКИ", "ЛУЧНИКИ", "ПРИСТЫ", "СИНЫ", "ШАМЫ", "СТРАЖИ", "МИСТИКИ"]
+
+    # Группируем ники по разделам
+    grouped = {section: [] for section in section_order}
+    for uid, nick, user_class, _ in users:
+        section = class_mapping.get(user_class.upper())
+        if section:
+            grouped[section].append(nick)
+        else:
+            logging.warning(f"Неизвестный класс: {user_class}")
+
+    # Сортируем ники внутри каждой группы по алфавиту
+    for section in grouped:
+        grouped[section].sort()
+
+    # 3. Открываем лист "ШАБЛОН АКТИВНОСТИ"
+    spreadsheet = get_google_spreadsheet()
+    if not spreadsheet:
+        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
+        return
+    try:
+        ws = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
+    except gspread.WorksheetNotFound:
+        await update.message.reply_text("❌ Лист 'ШАБЛОН АКТИВНОСТИ' не найден. Создайте его вручную.")
+        return
+
+    # 4. Находим строки с заголовками разделов (столбец B)
+    all_values = ws.get_all_values()
+    header_rows = {}  # section_name -> row_index (1-базированный)
+    for idx, row in enumerate(all_values, start=1):
+        if len(row) >= 2:
+            cell_value = row[1].strip()
+            if cell_value in section_order:
+                header_rows[cell_value] = idx
+
+    # Проверяем, что все разделы найдены
+    missing_sections = [s for s in section_order if s not in header_rows]
+    if missing_sections:
+        await update.message.reply_text(f"⚠️ В шаблоне не найдены разделы: {', '.join(missing_sections)}. Добавьте их вручную.")
+        return
+
+    # 5. Синхронизация по каждому разделу
+    total_updated = 0
+    for idx, section in enumerate(section_order):
+        header_row = header_rows[section]
+        next_header_row = header_rows.get(section_order[idx+1]) if idx+1 < len(section_order) else None
+
+        # Определяем количество доступных строк под разделом
+        if next_header_row:
+            available_rows = next_header_row - header_row - 1
+        else:
+            # последний раздел – до конца листа
+            available_rows = len(all_values) - header_row
+
+        nicks = grouped.get(section, [])
+        needed_rows = len(nicks)
+
+        # Если ников больше, чем доступных строк – вставляем недостающие
+        if needed_rows > available_rows:
+            rows_to_insert = needed_rows - available_rows
+            if next_header_row:
+                insert_index = next_header_row  # вставляем перед следующим заголовком
+            else:
+                insert_index = len(all_values) + 1  # в конец
+            # Вставляем строки (одну за раз, начиная с конца, чтобы не сбить индексы)
+            for _ in range(rows_to_insert):
+                ws.insert_rows(insert_index, amount=1)
+                # После вставки индексы сдвигаются, поэтому увеличиваем insert_index (если вставляем перед одним и тем же местом)
+                # Но так как мы вставляем перед next_header_row, при каждой вставке next_header_row смещается на 1,
+                # поэтому мы должны вставлять всегда на одну и ту же позицию (insert_index не меняется, но после вставки следующая вставка
+                # должна быть на ту же позицию, потому что строка сдвинулась). Проще вставить все строки за один раз.
+                # Однако gspread не поддерживает массовую вставку с указанием количества, поэтому будем вставлять по одной, но сохраняя индекс.
+                # После вставки одной строки, следующая вставка должна быть на тот же индекс (т.к. строка сдвинулась).
+                pass
+            # Альтернатива: использовать batch_update, но это сложнее. Для простоты вставим по одной, но каждый раз на тот же индекс.
+            # Для этого нужно после каждой вставки не увеличивать insert_index, а оставлять прежним, потому что строка, перед которой вставляем, смещается вниз.
+            # Т.е. вставляем rows_to_insert раз на позицию insert_index.
+            for _ in range(rows_to_insert):
+                ws.insert_rows(insert_index, amount=1)
+                # insert_index не меняем, так как следующая вставка должна быть перед той же строкой (которая теперь сдвинулась)
+            # После вставки обновим all_values (перечитаем лист) – но проще потом обновить значения.
+            # Перечитываем лист, чтобы получить актуальные индексы
+            all_values = ws.get_all_values()
+            # Корректируем header_rows для следующих разделов (их индексы сдвинулись)
+            for s in section_order[idx+1:]:
+                header_rows[s] += rows_to_insert
+            # Также сдвигаем текущий next_header_row для следующего цикла, но мы его не используем дальше в этом цикле
+
+        # Теперь записываем ники в столбец B, начиная с header_row+1
+        start_row = header_row + 1
+        for i, nick in enumerate(nicks):
+            ws.update_cell(start_row + i, 2, nick)  # столбец B = номер 2
+            total_updated += 1
+
+        # Очищаем оставшиеся ячейки в этом блоке (если ников меньше, чем было строк)
+        # Это необязательно, но для чистоты можно очистить лишние строки (которые остались пустыми)
+        # Однако мы не удаляем строки, поэтому оставляем как есть – они будут пустыми.
+
+    await update.message.reply_text(f"✅ Синхронизация завершена.\nОбновлено ников: {total_updated}")
 
 # ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
 def get_responses_grouped_by_meeting(poll_id):
@@ -1975,6 +2100,7 @@ def main():
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
     app.add_handler(CommandHandler("calc_salary", calculate_salaries))
+    app.add_handler(CommandHandler("sync_pa", sync_pa_command))
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
 
