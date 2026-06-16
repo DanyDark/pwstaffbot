@@ -873,6 +873,8 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     headers = ["Ник", "Класс", "Ответ пользователя"]
     try:
         for meeting, responses in grouped.items():
+            # Сортировка по классу (второй элемент) и по нику (первый)
+            responses_sorted = sorted(responses, key=lambda x: (x[1], x[0]))
             sheet_name = sanitize_sheet_name(meeting)
             try:
                 worksheet = spreadsheet.worksheet(sheet_name)
@@ -880,15 +882,14 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except gspread.WorksheetNotFound:
                 worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
             data = [headers]
-            for nick, user_class, answer in responses:
+            for nick, user_class, answer in responses_sorted:
                 data.append([nick, user_class, answer])
             worksheet.update(values=data, range_name='A1')
-            sort_sheet_by_class(worksheet)
         await update.message.reply_text(f"✅ Результаты опроса выгружены на листы: {', '.join(grouped.keys())}")
     except Exception as e:
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
-
+        
 # ---------- КЕШ-ЗАЯВКИ ----------
 def create_cash_order(user_id, nick, photo_file_id):
     conn = sqlite3.connect(DB_FILE)
