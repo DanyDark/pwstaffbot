@@ -588,7 +588,8 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
         updated_rows += 1
 
 await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
-    async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
