@@ -1759,7 +1759,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # ---------- ОТМЕНА ----------
+    # ---------- ОТМЕНА (только для остальных состояний) ----------
     if text == "❌ Отмена":
         if context.user_data.get('cash_order'):
             del context.user_data['cash_order']
@@ -1785,19 +1785,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             await update.message.reply_text("Регистрация отменена.", reply_markup=get_main_keyboard(user_id))
             return
-        if context.user_data.get('admin_poll'):
-            del context.user_data['admin_poll']
-            await update.message.reply_text("Ручной опрос отменён.", reply_markup=get_main_keyboard(user_id))
-            return
         if context.user_data.get('reject_mode'):
             context.user_data.pop('reject_mode', None)
             await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
             return
-        # Если ничего не подошло – просто игнорируем
-        return
+        # Если ничего не подошло – просто игнорируем, не делаем return!
+        # Это позволит дойти до проверки admin_poll_step
 
-    # ====== РУЧНОЙ ОПРОС АДМИНОМ (ввод данных) ======
-    # Эта проверка должна быть ДО всех остальных!
+    # ---------- РУЧНОЙ ОПРОС АДМИНОМ (включая отмену) ----------
     if context.user_data.get('admin_poll_step') == 'awaiting_input':
         await handle_admin_poll_text(update, context)
         return
