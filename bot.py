@@ -572,6 +572,8 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Нет данных для расчета.")
         return
 
+    # Собираем данные для массового обновления
+    updates = []  # список словарей вида {'range': 'B2', 'values': [[...]]}
     updated_rows = 0
     for row_idx, row in enumerate(all_values[1:], start=2):
         nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
@@ -588,10 +590,20 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     elif cell_value == "БЫЛ ПЛ":
                         total_salary += 20_000_000
 
-        ws.update_cell(row_idx, salary_col, total_salary)
+        # Формируем обновление для ячейки ЗП
+        updates.append({
+            'range': f'{chr(64 + salary_col)}{row_idx}',  # например 'A2'
+            'values': [[total_salary]]
+        })
         updated_rows += 1
 
-    await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
+    if updates:
+        # Выполняем массовое обновление (batched)
+        ws.batch_update(updates)
+        await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
+    else:
+        await update.message.reply_text("Нет строк для обновления.")     
+
 
 async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
