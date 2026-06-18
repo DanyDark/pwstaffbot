@@ -1949,6 +1949,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await confirm_all_pending_command(update, context)
     elif text == "❌ Отказать" and is_admin(user_id):
         await reject_pending_menu(update, context)
+    elif text == "💰 Расчет ЗП" and is_admin(user_id):   # <-- ДОБАВЛЕНА ОБРАБОТКА КНОПКИ
+        await calculate_salaries(update, context)
+        return
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
         
