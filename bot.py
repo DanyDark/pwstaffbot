@@ -1853,9 +1853,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------- ОСНОВНОЕ МЕНЮ ----------
-    # ... (весь остальной код с кнопками и командами)
-
-    # ---------- ОСНОВНОЕ МЕНЮ ----------
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1889,6 +1886,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 emoji = "✅" if ans == "да" else "❌" if ans == "нет" else "❓"
                 msg_text += f"{emoji} *{meeting}*: {ans}\n"
             await update.message.reply_text(msg_text, parse_mode="Markdown")
+    elif text == "💰 Моя ЗП":
+        await my_salary(update, context)
+        return
     elif text == "❓ Помощь":
         await update.message.reply_text(
             "По всем вопросам и предложениям обращаться к @Dark_Dany_M и в клановый чат https://t.me/c/2254350662/44735"
