@@ -5,6 +5,7 @@ import json
 import traceback
 import requests
 import base64
+import asyncio
 from datetime import datetime, time
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -96,7 +97,6 @@ def init_db():
             requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Таблица для внешних ответов (админ за другого)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS external_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,12 +109,10 @@ def init_db():
             responded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Добавляем поле external_class, если его нет (миграция)
     cursor.execute("PRAGMA table_info(external_responses)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'external_class' not in columns:
         cursor.execute("ALTER TABLE external_responses ADD COLUMN external_class TEXT")
-    # Таблица для учёта созданных месячных листов активности
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS activity_months (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,14 +257,19 @@ def create_poll(text, meetings):
     cursor = conn.cursor()
     cursor.execute("UPDATE polls SET is_active = 0")
     meetings_json = json.dumps(meetings)
-    cursor.execute("INSERT INTO polls (text, meetings_json, is_active) VALUES (?, ?, 1)", (text, meetings_json))
+    cursor.execute(
+        "INSERT INTO polls (text, meetings_json, is_active) VALUES (?, ?, 1)",
+        (text, meetings_json)
+    )
     conn.commit()
     conn.close()
 
 def get_active_poll():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT poll_id, text, meetings_json, created_at FROM polls WHERE is_active = 1")
+    cursor.execute(
+        "SELECT poll_id, text, meetings_json, created_at FROM polls WHERE is_active = 1"
+    )
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -284,20 +287,22 @@ def save_responses(user_id, poll_id, responses_dict):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     for meeting, answer in responses_dict.items():
-        cursor.execute('''
-            INSERT OR REPLACE INTO poll_responses (user_id, poll_id, meeting, answer, responded_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, poll_id, meeting, answer))
+        cursor.execute(
+            "INSERT OR REPLACE INTO poll_responses (user_id, poll_id, meeting, answer, responded_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (user_id, poll_id, meeting, answer)
+        )
     conn.commit()
     conn.close()
 
 def save_external_response(poll_id, external_nick, external_class, meeting, answer, admin_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO external_responses (poll_id, external_nick, external_class, meeting, answer, admin_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (poll_id, external_nick, external_class, meeting, answer, admin_id))
+    cursor.execute(
+        "INSERT INTO external_responses (poll_id, external_nick, external_class, meeting, answer, admin_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (poll_id, external_nick, external_class, meeting, answer, admin_id)
+    )
     conn.commit()
     conn.close()
 
@@ -320,10 +325,10 @@ def get_user_current_poll_answers(user_id):
         return None
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT meeting, answer FROM poll_responses
-        WHERE user_id = ? AND poll_id = ?
-    ''', (user_id, poll['id']))
+    cursor.execute(
+        "SELECT meeting, answer FROM poll_responses WHERE user_id = ? AND poll_id = ?",
+        (user_id, poll['id'])
+    )
     rows = cursor.fetchall()
     conn.close()
     if rows:
@@ -335,7 +340,10 @@ def get_non_responders(poll_id):
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, nick FROM users")
     all_users = cursor.fetchall()
-    cursor.execute("SELECT DISTINCT user_id FROM poll_responses WHERE poll_id = ?", (poll_id,))
+    cursor.execute(
+        "SELECT DISTINCT user_id FROM poll_responses WHERE poll_id = ?",
+        (poll_id,)
+    )
     responders = set(row[0] for row in cursor.fetchall())
     conn.close()
     non_responders = [(uid, nick) for uid, nick in all_users if uid not in responders]
@@ -441,12 +449,10 @@ def get_or_create_monthly_activity_sheet(spreadsheet):
     except gspread.WorksheetNotFound:
         logging.error("Лист 'ШАБЛОН АКТИВНОСТИ' не найден в Google Sheets. Создайте его вручную.")
         raise Exception("Отсутствует шаблон активности")
-
     now = datetime.now()
     year = now.year
     month = now.month
     sheet_name = f"Активность {month:02d}.{year}"
-
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT sheet_name FROM activity_months WHERE year = ? AND month = ?", (year, month))
@@ -458,7 +464,6 @@ def get_or_create_monthly_activity_sheet(spreadsheet):
             return ws
         except gspread.WorksheetNotFound:
             logging.warning(f"Лист {row[0]} не найден, пересоздаём")
-
     new_ws = template.duplicate(insert_sheet_index=0, new_sheet_name=sheet_name)
     cursor.execute("INSERT INTO activity_months (year, month, sheet_name) VALUES (?, ?, ?)", (year, month, sheet_name))
     conn.commit()
@@ -472,14 +477,12 @@ def get_current_activity_sheet():
     return get_or_create_monthly_activity_sheet(spreadsheet)
 
 def find_column_by_header(ws, header_name):
-    """Возвращает номер столбца (1-базированный) по названию заголовка в первой строке"""
     headers = ws.row_values(1)
     for idx, h in enumerate(headers):
         if h.strip().lower() == header_name.strip().lower():
             return idx + 1
     return None
 
-# Функция для поиска столбца "НИК" (он в столбце C, но для надёжности ищем по заголовку)
 def find_nick_column(ws):
     headers = ws.row_values(1)
     for idx, h in enumerate(headers):
@@ -487,26 +490,21 @@ def find_nick_column(ws):
             return idx + 1
     return None
 
-# Конфигурация активностей: название -> (start_col, end_col) 1-базированные
 ACTIVITY_COLUMNS = {
-    "Комендант": (3, 7),   # C-G
-    "Баньши": (8, 11),     # H-K
-    "ГВГ": (12, 15)        # L-O
+    "Комендант": (3, 7),
+    "Баньши": (8, 11),
+    "ГВГ": (12, 15)
 }
 
 def get_available_activities(ws):
-    """Возвращает список активностей, которые есть в конфигурации (Комендант, Баньши, ГВГ)"""
     return list(ACTIVITY_COLUMNS.keys())
 
 def mark_activity_in_sheet(ws, activity_name, nicks):
-    """Ставит 'БЫЛ' в первую свободную ячейку в диапазоне активности для каждого найденного ника"""
     nick_col = find_nick_column(ws)
     if nick_col is None:
         raise Exception("В листе не найден столбец 'НИК'")
-    
     if activity_name not in ACTIVITY_COLUMNS:
         raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
-    
     start_col, end_col = ACTIVITY_COLUMNS[activity_name]
     all_values = ws.get_all_values()
     updated = 0
@@ -518,18 +516,15 @@ def mark_activity_in_sheet(ws, activity_name, nicks):
             continue
         if nick_in_sheet.lower() not in [n.lower() for n in nicks]:
             continue
-        # Ищем первую пустую ячейку в диапазоне активности для этой строки
         for col in range(start_col, end_col+1):
             if len(row) >= col and row[col-1] and row[col-1].strip():
                 continue
-            # Пустая ячейка найдена – ставим "БЫЛ"
             ws.update_cell(row_idx, col, "БЫЛ")
             updated += 1
             break
     return updated
 
 def get_user_activity_count(nick):
-    """Возвращает количество 'БЫЛ' для данного ника в текущем листе активности (по всем столбцам, кроме столбца 'НИК')"""
     try:
         ws = get_current_activity_sheet()
         nick_col = find_nick_column(ws)
@@ -539,7 +534,6 @@ def get_user_activity_count(nick):
         count = 0
         for row in all_values[1:]:
             if len(row) >= nick_col and row[nick_col-1].strip().lower() == nick.lower():
-                # Считаем "БЫЛ" во всех столбцах, кроме столбца с ником
                 for col_idx, val in enumerate(row):
                     if col_idx != nick_col-1 and val == "БЫЛ":
                         count += 1
@@ -548,38 +542,32 @@ def get_user_activity_count(nick):
     except Exception as e:
         logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
         return 0
-        
+
 async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-
     try:
         ws = get_current_activity_sheet()
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
         return
-
     nick_col = find_column_by_header(ws, "НИК")
     salary_col = find_column_by_header(ws, "Общая ЗП")
     if nick_col is None or salary_col is None:
         await update.message.reply_text("❌ В листе не найдены столбцы 'НИК' или 'Общая ЗП'.")
         return
-
     all_values = ws.get_all_values()
     if len(all_values) < 2:
         await update.message.reply_text("Нет данных для расчета.")
         return
-
-    # Собираем данные для массового обновления
-    updates = []  # список словарей вида {'range': 'B2', 'values': [[...]]}
+    updates = []
     updated_rows = 0
     for row_idx, row in enumerate(all_values[1:], start=2):
         nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
         if not nick:
             continue
-
         total_salary = 0
         for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
             for col in range(start_col, end_col+1):
@@ -589,35 +577,26 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         total_salary += 10_000_000
                     elif cell_value == "БЫЛ ПЛ":
                         total_salary += 20_000_000
-
-        # Формируем обновление для ячейки ЗП
         updates.append({
-            'range': f'{chr(64 + salary_col)}{row_idx}',  # например 'A2'
+            'range': f'{chr(64 + salary_col)}{row_idx}',
             'values': [[total_salary]]
         })
         updated_rows += 1
-
     if updates:
-        # Выполняем массовое обновление (batched)
         ws.batch_update(updates)
         await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
     else:
-        await update.message.reply_text("Нет строк для обновления.")     
-
+        await update.message.reply_text("Нет строк для обновления.")
 
 async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-
-    # 1. Получаем всех пользователей из БД
     users = get_all_users()
     if not users:
         await update.message.reply_text("Нет зарегистрированных пользователей.")
         return
-
-    # 2. Маппинг классов из БД в названия разделов в шаблоне
     class_mapping = {
         "ВАР": "ВАРЫ",
         "МАГ": "МАГИ",
@@ -630,10 +609,7 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "СИК": "СТРАЖИ",
         "МИСТИК": "МИСТИКИ"
     }
-    # Порядок разделов в шаблоне (как они идут сверху вниз)
     section_order = ["ВАРЫ", "МАГИ", "ДРУЛИ", "ТАНКИ", "ЛУЧНИКИ", "ПРИСТЫ", "СИНЫ", "ШАМЫ", "СТРАЖИ", "МИСТИКИ"]
-
-    # Группируем ники по разделам
     grouped = {section: [] for section in section_order}
     for uid, nick, user_class, _ in users:
         section = class_mapping.get(user_class.upper())
@@ -641,12 +617,8 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             grouped[section].append(nick)
         else:
             logging.warning(f"Неизвестный класс: {user_class}")
-
-    # Сортируем ники внутри каждой группы по алфавиту
     for section in grouped:
         grouped[section].sort()
-
-    # 3. Открываем лист "ШАБЛОН АКТИВНОСТИ"
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
         await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
@@ -656,87 +628,49 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except gspread.WorksheetNotFound:
         await update.message.reply_text("❌ Лист 'ШАБЛОН АКТИВНОСТИ' не найден. Создайте его вручную.")
         return
-
-    # 4. Находим строки с заголовками разделов (столбец B)
     all_values = ws.get_all_values()
-    header_rows = {}  # section_name -> row_index (1-базированный)
+    header_rows = {}
     for idx, row in enumerate(all_values, start=1):
         if len(row) >= 2:
             cell_value = row[1].strip()
             if cell_value in section_order:
                 header_rows[cell_value] = idx
-
-    # Проверяем, что все разделы найдены
     missing_sections = [s for s in section_order if s not in header_rows]
     if missing_sections:
         await update.message.reply_text(f"⚠️ В шаблоне не найдены разделы: {', '.join(missing_sections)}. Добавьте их вручную.")
         return
-
-    # 5. Синхронизация по каждому разделу
     total_updated = 0
     for idx, section in enumerate(section_order):
         header_row = header_rows[section]
         next_header_row = header_rows.get(section_order[idx+1]) if idx+1 < len(section_order) else None
-
-        # Определяем количество доступных строк под разделом
         if next_header_row:
             available_rows = next_header_row - header_row - 1
         else:
-            # последний раздел – до конца листа
             available_rows = len(all_values) - header_row
-
         nicks = grouped.get(section, [])
         needed_rows = len(nicks)
-
-        # Если ников больше, чем доступных строк – вставляем недостающие
         if needed_rows > available_rows:
             rows_to_insert = needed_rows - available_rows
             if next_header_row:
-                insert_index = next_header_row  # вставляем перед следующим заголовком
+                insert_index = next_header_row
             else:
-                insert_index = len(all_values) + 1  # в конец
-            # Вставляем строки (одну за раз, начиная с конца, чтобы не сбить индексы)
+                insert_index = len(all_values) + 1
             for _ in range(rows_to_insert):
                 ws.insert_rows(insert_index, amount=1)
-                # После вставки индексы сдвигаются, поэтому увеличиваем insert_index (если вставляем перед одним и тем же местом)
-                # Но так как мы вставляем перед next_header_row, при каждой вставке next_header_row смещается на 1,
-                # поэтому мы должны вставлять всегда на одну и ту же позицию (insert_index не меняется, но после вставки следующая вставка
-                # должна быть на ту же позицию, потому что строка сдвинулась). Проще вставить все строки за один раз.
-                # Однако gspread не поддерживает массовую вставку с указанием количества, поэтому будем вставлять по одной, но сохраняя индекс.
-                # После вставки одной строки, следующая вставка должна быть на тот же индекс (т.к. строка сдвинулась).
-                pass
-            # Альтернатива: использовать batch_update, но это сложнее. Для простоты вставим по одной, но каждый раз на тот же индекс.
-            # Для этого нужно после каждой вставки не увеличивать insert_index, а оставлять прежним, потому что строка, перед которой вставляем, смещается вниз.
-            # Т.е. вставляем rows_to_insert раз на позицию insert_index.
-            for _ in range(rows_to_insert):
-                ws.insert_rows(insert_index, amount=1)
-                # insert_index не меняем, так как следующая вставка должна быть перед той же строкой (которая теперь сдвинулась)
-            # После вставки обновим all_values (перечитаем лист) – но проще потом обновить значения.
-            # Перечитываем лист, чтобы получить актуальные индексы
             all_values = ws.get_all_values()
-            # Корректируем header_rows для следующих разделов (их индексы сдвинулись)
             for s in section_order[idx+1:]:
-                header_rows[s] += rows_to_insert
-            # Также сдвигаем текущий next_header_row для следующего цикла, но мы его не используем дальше в этом цикле
-
-        # Теперь записываем ники в столбец B, начиная с header_row+1
+                if s in header_rows:
+                    header_rows[s] += rows_to_insert
         start_row = header_row + 1
         for i, nick in enumerate(nicks):
-            ws.update_cell(start_row + i, 2, nick)  # столбец B = номер 2
+            ws.update_cell(start_row + i, 2, nick)
             total_updated += 1
-
-        # Очищаем оставшиеся ячейки в этом блоке (если ников меньше, чем было строк)
-        # Это необязательно, но для чистоты можно очистить лишние строки (которые остались пустыми)
-        # Однако мы не удаляем строки, поэтому оставляем как есть – они будут пустыми.
-
     await update.message.reply_text(f"✅ Синхронизация завершена.\nОбновлено ников: {total_updated}")
-    
+
 def sync_pa_internal():
-    """Внутренняя синхронизация шаблона (без отправки сообщений в чат)"""
     users = get_all_users()
     if not users:
         return
-
     class_mapping = {
         "ВАР": "ВАРЫ",
         "МАГ": "МАГИ",
@@ -750,7 +684,6 @@ def sync_pa_internal():
         "МИСТИК": "МИСТИКИ"
     }
     section_order = ["ВАРЫ", "МАГИ", "ДРУЛИ", "ТАНКИ", "ЛУЧНИКИ", "ПРИСТЫ", "СИНЫ", "ШАМЫ", "СТРАЖИ", "МИСТИКИ"]
-
     grouped = {section: [] for section in section_order}
     for uid, nick, user_class, _ in users:
         section = class_mapping.get(user_class.upper())
@@ -758,10 +691,8 @@ def sync_pa_internal():
             grouped[section].append(nick)
         else:
             logging.warning(f"Неизвестный класс: {user_class}")
-
     for section in grouped:
         grouped[section].sort()
-
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
         logging.error("Не удалось подключиться к Google Sheets для синхронизации шаблона")
@@ -771,7 +702,6 @@ def sync_pa_internal():
     except gspread.WorksheetNotFound:
         logging.error("Лист 'ШАБЛОН АКТИВНОСТИ' не найден")
         return
-
     all_values = ws.get_all_values()
     header_rows = {}
     for idx, row in enumerate(all_values, start=1):
@@ -779,25 +709,20 @@ def sync_pa_internal():
             cell_value = row[1].strip()
             if cell_value in section_order:
                 header_rows[cell_value] = idx
-
     missing_sections = [s for s in section_order if s not in header_rows]
     if missing_sections:
         logging.warning(f"В шаблоне не найдены разделы: {', '.join(missing_sections)}")
         return
-
     total_updated = 0
     for idx, section in enumerate(section_order):
         header_row = header_rows[section]
         next_header_row = header_rows.get(section_order[idx+1]) if idx+1 < len(section_order) else None
-
         if next_header_row:
             available_rows = next_header_row - header_row - 1
         else:
             available_rows = len(all_values) - header_row
-
         nicks = grouped.get(section, [])
         needed_rows = len(nicks)
-
         if needed_rows > available_rows:
             rows_to_insert = needed_rows - available_rows
             if next_header_row:
@@ -806,17 +731,14 @@ def sync_pa_internal():
                 insert_index = len(all_values) + 1
             for _ in range(rows_to_insert):
                 ws.insert_rows(insert_index, amount=1)
-            # Перечитываем лист, чтобы обновить индексы для следующих разделов
             all_values = ws.get_all_values()
             for s in section_order[idx+1:]:
                 if s in header_rows:
                     header_rows[s] += rows_to_insert
-
         start_row = header_row + 1
         for i, nick in enumerate(nicks):
             ws.update_cell(start_row + i, 2, nick)
             total_updated += 1
-
     logging.info(f"Синхронизация шаблона завершена. Обновлено ников: {total_updated}")
     return total_updated
 
@@ -825,24 +747,22 @@ def get_responses_grouped_by_meeting(poll_id):
     grouped = {}
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Обычные ответы пользователей
-    cursor.execute('''
-        SELECT u.nick, u.class, pr.meeting, pr.answer
-        FROM poll_responses pr
-        JOIN users u ON pr.user_id = u.user_id
-        WHERE pr.poll_id = ?
-    ''', (poll_id,))
+    cursor.execute(
+        "SELECT u.nick, u.class, pr.meeting, pr.answer "
+        "FROM poll_responses pr JOIN users u ON pr.user_id = u.user_id "
+        "WHERE pr.poll_id = ?",
+        (poll_id,)
+    )
     rows = cursor.fetchall()
     for nick, user_class, meeting, answer in rows:
         if meeting not in grouped:
             grouped[meeting] = []
         grouped[meeting].append((nick, user_class if user_class else "Не указан", answer))
-    # Внешние ответы (админ за другого)
-    cursor.execute('''
-        SELECT external_nick, external_class, meeting, answer
-        FROM external_responses
-        WHERE poll_id = ?
-    ''', (poll_id,))
+    cursor.execute(
+        "SELECT external_nick, external_class, meeting, answer "
+        "FROM external_responses WHERE poll_id = ?",
+        (poll_id,)
+    )
     ext_rows = cursor.fetchall()
     for ext_nick, ext_class, meeting, answer in ext_rows:
         if meeting not in grouped:
@@ -850,7 +770,7 @@ def get_responses_grouped_by_meeting(poll_id):
         grouped[meeting].append((ext_nick, ext_class if ext_class else "Внешний", answer))
     conn.close()
     return grouped
-    
+
 def sanitize_sheet_name(name):
     forbidden = r'[]:*?/\\'
     for ch in forbidden:
@@ -885,7 +805,6 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     headers = ["Ник", "Класс", "Ответ пользователя"]
     try:
         for meeting, responses in grouped.items():
-            # Сортировка по классу (второй элемент) и по нику (первый)
             responses_sorted = sorted(responses, key=lambda x: (x[1], x[0]))
             sheet_name = sanitize_sheet_name(meeting)
             try:
@@ -901,22 +820,26 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Ошибка при экспорте: {e}\n{traceback.format_exc()}")
         await update.message.reply_text("❌ Ошибка при экспорте в Google Sheets.")
-        
+
 # ---------- КЕШ-ЗАЯВКИ ----------
 def create_cash_order(user_id, nick, photo_file_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status)
-        VALUES (?, ?, ?, ?, 'pending')
-    ''', (user_id, nick, photo_file_id, "Золотые яйца"))
+    cursor.execute(
+        "INSERT INTO cash_orders (user_id, nick, photo_file_id, description, status) "
+        "VALUES (?, ?, ?, ?, 'pending')",
+        (user_id, nick, photo_file_id, "Золотые яйца")
+    )
     conn.commit()
     conn.close()
 
 def get_pending_orders():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT order_id, user_id, nick, photo_file_id, description FROM cash_orders WHERE status = 'pending' ORDER BY created_at")
+    cursor.execute(
+        "SELECT order_id, user_id, nick, photo_file_id, description "
+        "FROM cash_orders WHERE status = 'pending' ORDER BY created_at"
+    )
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -924,7 +847,10 @@ def get_pending_orders():
 def update_order_status(order_id, status):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("UPDATE cash_orders SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE order_id = ?", (status, order_id))
+    cursor.execute(
+        "UPDATE cash_orders SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+        (status, order_id)
+    )
     conn.commit()
     conn.close()
 
@@ -1094,9 +1020,8 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_mode', None)
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
-    # Возвращаем в админ-панель
     await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
-# ---------- ИСПРАВЛЕНИЕ НИКА -------------
+
 async def edit_nick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1134,7 +1059,6 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Этот ник уже занят другим пользователем. Введите другой.")
         return
     target_user_id = context.user_data['edit_target_user_id']
-    # Обновляем ник в базе
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET nick = ? WHERE user_id = ?", (new_nick, target_user_id))
@@ -1144,10 +1068,9 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_nick_mode', None)
     context.user_data.pop('edit_old_nick', None)
     context.user_data.pop('edit_target_user_id', None)
-    # Возвращаем в админ-панель
     await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
 
-# ---------- АКТИВНОСТЬ ИГРОКОВ (НОВАЯ ВЕРСИЯ) ----------
+# ---------- АКТИВНОСТЬ ИГРОКОВ ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1159,23 +1082,17 @@ async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность.\n\nДоступные активности: Комендант, Баньши, ГВГ.\n\nДля отмены нажмите «❌ Отмена».",
         reply_markup=keyboard
     )
-    
+
 def sort_sheet_by_class(worksheet):
-    """Сортирует лист по столбцу 'Класс' (столбец B) от А до Я, сохраняя заголовок"""
     all_values = worksheet.get_all_values()
     if len(all_values) < 2:
         return
-
     headers = all_values[0]
     data = all_values[1:]
-    # Проверяем, что столбец B есть
     if len(headers) < 2:
         return
-    # Сортируем по столбцу B (класс)
     data_sorted = sorted(data, key=lambda row: row[1].strip() if len(row) > 1 else "")
-    # Объединяем заголовки и отсортированные данные
     new_values = [headers] + data_sorted
-    # Очищаем лист и записываем отсортированные данные
     worksheet.clear()
     if new_values:
         worksheet.update(values=new_values, range_name='A1')
@@ -1196,11 +1113,8 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     if not raw_nicks:
         await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
-
     users = get_all_users()
     known_nicks = [nick for _, nick, _, _ in users]
-
-    # Для каждого распознанного ника ищем лучшее совпадение (порог 70)
     final_ordered_nicks = []
     matched_count = 0
     unmatched_nicks = []
@@ -1218,22 +1132,18 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             final_ordered_nicks.append(rn)
             unmatched_nicks.append(rn)
-
     context.user_data['activity_nicks'] = final_ordered_nicks
     context.user_data['activity_raw'] = raw_nicks
     context.user_data['activity_matched_count'] = matched_count
     context.user_data['activity_unmatched'] = unmatched_nicks
-
     if not final_ordered_nicks:
         await update.message.reply_text("Не удалось распознать ни одного ника после сопоставления.")
         return
-
     stats = f"✅ Распознано: {len(raw_nicks)} ников.\n" \
             f"🎯 Совпало с зарегистрированными: {matched_count}.\n" \
             f"❓ Не распознано (будут записаны как есть): {len(unmatched_nicks)}.\n\n"
     if unmatched_nicks:
         stats += f"Неопознанные: {', '.join(unmatched_nicks)}\n\n"
-
     activities = ["Комендант", "Баньши", "ГВГ"]
     keyboard = []
     for act in activities:
@@ -1264,7 +1174,6 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_mode', None)
         context.user_data.pop('activity_step', None)
         return
-
     try:
         ws = get_current_activity_sheet()
         updated = mark_activity_in_sheet_with_pl(ws, activity, nicks, threshold=70)
@@ -1273,8 +1182,6 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         if nick_col:
             all_vals = ws.get_all_values()
             all_nicks_in_sheet = [row[nick_col-1].strip() for row in all_vals[1:] if row and len(row) >= nick_col and row[nick_col-1].strip()]
-        
-        # Нечёткое сравнение для формирования списка не найденных (порог 70)
         not_found = []
         for recognized_nick in nicks:
             best_ratio = 0
@@ -1284,7 +1191,6 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
                     best_ratio = ratio
             if best_ratio < 70:
                 not_found.append(recognized_nick)
-        
         await update.message.reply_text(
             f"✅ Готово!\nАктивность: {activity}\nПоставлено отметок: {updated}\nРаспознано ников: {len(nicks)}"
             + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
@@ -1298,15 +1204,11 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_nicks', None)
 
 def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=70):
-    """Ставит 'БЫЛ ПЛ' для первого распознанного ника, 'БЫЛ' для остальных.
-       Для каждого распознанного ника ищет наиболее похожий ник в столбце 'НИК' (нечёткое сравнение)."""
     nick_col = find_column_by_header(ws, "НИК")
     if nick_col is None:
         raise Exception("В листе не найден столбец 'НИК'")
-    
     if activity_name not in ACTIVITY_COLUMNS:
         raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
-    
     start_col, end_col = ACTIVITY_COLUMNS[activity_name]
     all_values = ws.get_all_values()
     table_nicks = []
@@ -1315,7 +1217,6 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=7
             nick_val = row[nick_col-1].strip()
             if nick_val:
                 table_nicks.append((row_idx, nick_val))
-    
     updated = 0
     for idx, recognized_nick in enumerate(ordered_nicks):
         is_first = (idx == 0)
@@ -1326,7 +1227,6 @@ def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=7
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_match_row = row_idx
-                best_match_nick = table_nick
         if best_ratio >= threshold:
             row_values = ws.row_values(best_match_row)
             for col in range(start_col, end_col+1):
@@ -1354,12 +1254,11 @@ async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("🔙 Назад")]
     ]
     await update.message.reply_text("Управление регистрацией:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-    
+
 def get_reject_keyboard():
     pending = get_pending_users()
     if not pending:
         return None
-    # Формируем кнопки в 2 столбца
     keyboard = []
     row = []
     for uid, nick, user_class, _ in pending:
@@ -1371,6 +1270,7 @@ def get_reject_keyboard():
         keyboard.append(row)
     keyboard.append([KeyboardButton("🔙 Назад")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 async def reject_pending_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1396,14 +1296,12 @@ async def handle_reject_pending(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if text.startswith("❌ "):
         nick_to_reject = text[2:]
-        # Удаляем заявку из pending_users
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM pending_users WHERE nick = ?", (nick_to_reject,))
         conn.commit()
         conn.close()
         await update.message.reply_text(f"❌ Заявка для {nick_to_reject} отклонена.")
-        # Показываем обновлённый список для отказа
         await reject_pending_menu(update, context)
         return
 
@@ -1424,7 +1322,7 @@ async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYP
             msg = ""
     if msg:
         await update.message.reply_text(msg, parse_mode="Markdown")
-        
+
 async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -1432,7 +1330,6 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
         return
     confirmed = confirm_all_pending()
     count = len(confirmed)
-
     active_poll = get_active_poll()
     if active_poll:
         for uid, nick, _ in confirmed:
@@ -1441,15 +1338,11 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
                 logging.info(f"Отправлен опрос новому пользователю {nick} (ID: {uid})")
             except Exception as e:
                 logging.error(f"Не удалось отправить опрос пользователю {uid}: {e}")
-
-    # Автоматическая синхронизация шаблона
     try:
-        sync_pa_internal()
+        await asyncio.to_thread(sync_pa_internal)
     except Exception as e:
         logging.error(f"Ошибка при синхронизации шаблона: {e}")
-
     await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
-
 
 # ---------- ПЛАНИРОВЩИК ОБЪЯВЛЕНИЙ (БОССЫ) ----------
 async def send_announcement_to_all(text):
@@ -1510,20 +1403,17 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-    
+
 async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id) or context.user_data.get('admin_poll_step') != 'awaiting_input':
         return
     text = update.message.text.strip()
-    
-    # ОБРАБОТКА ОТМЕНЫ
     if text == "❌ Отмена":
         context.user_data.pop('admin_poll_step', None)
         context.user_data.pop('admin_poll_data', None)
         await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
         return
-    
     parts = [part.strip() for part in text.split('\\')]
     if len(parts) < 3:
         await update.message.reply_text("❌ Неверный формат. Ожидается: НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 ...")
@@ -1545,105 +1435,103 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
     poll_id = poll_data['poll_id']
     for meeting, answer in zip(meetings, answers):
         save_external_response(poll_id, nick, user_class, meeting, answer, user_id)
-    # НЕ удаляем состояние, чтобы можно было ввести следующую строку
     await update.message.reply_text(
         f"✅ Ответы для {nick} (класс: {user_class}) сохранены!\n"
         f"Встречи и ответы:\n" + "\n".join([f"• {m}: {a}" for m, a in zip(meetings, answers)]),
         reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     )
 
-async def admin_poll_nick_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- НОВЫЙ СЦЕНАРИЙ СОЗДАНИЯ ГВГ-ОПРОСА ----------
+async def start_gvg_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_admin(user_id) or 'admin_poll' not in context.user_data:
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
         return
-    data = context.user_data['admin_poll']
-    if data.get('step') != 'awaiting_nick':
-        return
-    nick = update.message.text.strip()
-    if nick == "❌ Отмена":
-        del context.user_data['admin_poll']
-        await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
-        return
-    if not nick:
-        await update.message.reply_text("Ник не может быть пустым. Попробуйте ещё раз.")
-        return
-    data['external_nick'] = nick
-    poll = get_active_poll()
-    if not poll:
-        del context.user_data['admin_poll']
-        await update.message.reply_text("Активный опрос исчез. Попробуйте позже.")
-        return
-    data['poll_id'] = poll['id']
-    data['poll_text'] = poll['text']
-    data['meetings'] = poll['meetings']
-    data['current_index'] = 0
-    data['answers'] = {}
-    data['step'] = 'polling'
-    await send_admin_poll_question(update, context, user_id)
+    context.user_data['gvg_poll'] = {'step': 'datetime'}
+    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    await update.message.reply_text(
+        "Введите дату и время ГВГ в формате:\n"
+        "`ДД.ММ.ГГГГ ЧЧ:ММ` (например, 25.06.2026 19:00)\n\n"
+        "Для отмены нажмите «❌ Отмена».",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
 
-async def send_admin_poll_question(update, context, user_id):
-    data = context.user_data.get('admin_poll')
-        # Ручной опрос админом (ввод данных)
-    if context.user_data.get('admin_poll'):
-        await handle_admin_poll_text(update, context)
+async def handle_gvg_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'gvg_poll' not in context.user_data:
         return
-    idx = data['current_index']
-    meetings = data['meetings']
-    poll_text = data['poll_text']
-    if idx >= len(meetings):
-        answers = data['answers']
-        summary = "✅ *Ваши ответы:*\n\n"
-        for m in meetings:
-            ans = answers.get(m, "❌ Не отвечен")
-            summary += f"• {m} → {ans}\n"
-        summary += "\nСохранить ответы?"
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    text = update.message.text.strip()
+    data = context.user_data['gvg_poll']
+    if text == "❌ Отмена":
+        context.user_data.pop('gvg_poll', None)
+        await update.message.reply_text("Создание ГВГ-опроса отменено.", reply_markup=get_admin_keyboard())
+        return
+    if data['step'] == 'datetime':
+        try:
+            datetime.strptime(text, "%d.%m.%Y %H:%M")
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат. Используйте `ДД.ММ.ГГГГ ЧЧ:ММ`")
+            return
+        data['datetime'] = text
+        data['step'] = 'opponents'
+        await update.message.reply_text("Введите название противников (или «-», если нет):")
+        return
+    elif data['step'] == 'opponents':
+        data['opponents'] = text
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Да, сохранить", callback_data="admin_poll_save")],
-            [InlineKeyboardButton("❌ Нет, отменить", callback_data="admin_poll_cancel")]
+            [InlineKeyboardButton("➕ Продолжить (добавить ещё ГВГ)", callback_data="gvg_add_more")],
+            [InlineKeyboardButton("✅ Закончить и создать опрос", callback_data="gvg_finish")]
         ])
-        await context.bot.send_message(chat_id=user_id, text=summary, parse_mode="Markdown", reply_markup=keyboard)
-        return
-    meeting = meetings[idx]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Да", callback_data=f"admin_poll_ans_да"),
-            InlineKeyboardButton("❌ Нет", callback_data=f"admin_poll_ans_нет"),
-            InlineKeyboardButton("❓ Не знаю", callback_data=f"admin_poll_ans_не знаю")
-        ]
-    ])
-    text = f"📢 *Опрос за другого*\n\n{poll_text}\n\nВопрос {idx+1} из {len(meetings)}:\n{meeting}\n\nВаш ответ:"
-    await context.bot.send_message(chat_id=user_id, text=text, parse_mode="Markdown", reply_markup=keyboard)
+        await update.message.reply_text(
+            f"ГВГ добавлен:\n📅 {data['datetime']}\n⚔️ Противники: {data['opponents']}\n\n"
+            "Выберите действие:",
+            reply_markup=keyboard
+        )
+        data['step'] = 'waiting_choice'
 
-async def admin_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
     user_id = query.from_user.id
-    if not is_admin(user_id) or 'admin_poll' not in context.user_data:
-        await query.edit_message_text("Сессия опроса не найдена. Начните заново.")
+    if not is_admin(user_id) or 'gvg_poll' not in context.user_data:
+        await query.edit_message_text("Сессия создания опроса не найдена.")
         return
-    poll_data = context.user_data['admin_poll']
-    if data.startswith("admin_poll_ans_"):
-        answer = data.split('_')[3]
-        meeting = poll_data['meetings'][poll_data['current_index']]
-        poll_data['answers'][meeting] = answer
-        poll_data['current_index'] += 1
-        await query.edit_message_text(f"✅ Ответ на '{meeting}' сохранён. Следующий вопрос...")
-        await send_admin_poll_question(update, context, user_id)
-    elif data == "admin_poll_save":
-        poll_id = poll_data['poll_id']
-        external_nick = poll_data['external_nick']
-        admin_id = user_id
-        answers = poll_data['answers']
-        for meeting, ans in answers.items():
-            save_external_response(poll_id, external_nick, meeting, ans, admin_id)
-        del context.user_data['admin_poll']
-        await query.edit_message_text(f"✅ Ответы для пользователя {external_nick} сохранены! Они будут учтены в результатах опроса.")
-        await context.bot.send_message(chat_id=user_id, text="Управление опросами:", reply_markup=get_polls_management_keyboard())
-    elif data == "admin_poll_cancel":
-        del context.user_data['admin_poll']
-        await query.edit_message_text("Опрос отменён. Ответы не сохранены.")
-        await context.bot.send_message(chat_id=user_id, text="Управление опросами:", reply_markup=get_polls_management_keyboard())
+    data = context.user_data['gvg_poll']
+    if query.data == "gvg_add_more":
+        if 'gvg_list' not in data:
+            data['gvg_list'] = []
+        data['gvg_list'].append({
+            'datetime': data['datetime'],
+            'opponents': data['opponents']
+        })
+        data['step'] = 'datetime'
+        keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        await query.edit_message_text(
+            "Введите дату и время следующего ГВГ в формате:\n"
+            "`ДД.ММ.ГГГГ ЧЧ:ММ`\n\n"
+            "Для завершения нажмите кнопку «❌ Отмена» и завершите опрос.",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    elif query.data == "gvg_finish":
+        if 'gvg_list' not in data:
+            data['gvg_list'] = []
+        if 'datetime' in data and 'opponents' in data:
+            data['gvg_list'].append({
+                'datetime': data['datetime'],
+                'opponents': data['opponents']
+            })
+        meetings = [f"{g['datetime']} - {g['opponents']}" for g in data['gvg_list']]
+        poll_text = f"ГВГ на {datetime.now().strftime('%d.%m.%Y')}"
+        create_poll(poll_text, meetings)
+        await query.edit_message_text(
+            f"✅ Опрос ГВГ создан!\n\nКоличество ГВГ: {len(meetings)}\nВстречи:\n" + "\n".join(meetings)
+        )
+        context.user_data.pop('gvg_poll', None)
+        await query.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
@@ -1655,38 +1543,31 @@ def get_main_keyboard(user_id):
     if is_admin(user_id):
         keyboard.append([KeyboardButton("📊 Админ-панель")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
+
 async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_valid(user_id):
         await update.message.reply_text("Вы не зарегистрированы. Нажмите /start.")
         return
-
     nick = get_user_nick(user_id)
     if not nick:
         await update.message.reply_text("Не удалось определить ваш ник.")
         return
-
     try:
         ws = get_current_activity_sheet()
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
         return
-
     nick_col = find_column_by_header(ws, "НИК")
     if nick_col is None:
         await update.message.reply_text("❌ В листе не найден столбец 'НИК'.")
         return
-
     all_values = ws.get_all_values()
     total_salary = 0
-
     for row_idx, row in enumerate(all_values[1:], start=2):
         current_nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
         if current_nick.lower() != nick.lower():
             continue
-
-        # Считаем ЗП по активностям (только в диапазонах ACTIVITY_COLUMNS)
         for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
             for col in range(start_col, end_col+1):
                 if len(row) >= col:
@@ -1695,9 +1576,7 @@ async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         total_salary += 10_000_000
                     elif cell_value == "БЫЛ ПЛ":
                         total_salary += 20_000_000
-        break  # нашли пользователя, дальше не ищем
-
-    # Переводим в чеки (1 чек = 10_000_000)
+        break
     checks = total_salary // 10_000_000
     await update.message.reply_text(
         f"💰 *Ваша зарплата за текущий месяц*\n\n"
@@ -1768,11 +1647,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['awaiting_nick'] = True
 
+def escape_md(text):
+    chars = r'_*[]()~`>#+-=|{}.!'
+    for ch in chars:
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    users = get_all_users()
+    if not users:
+        await update.message.reply_text("Нет пользователей.")
+        return
+    message_text = "📋 *Список пользователей:*\n\n"
+    for uid, nick, user_class, _ in users:
+        safe_nick = escape_md(nick)
+        safe_class = escape_md(user_class if user_class else "Не указан")
+        message_text += f"• {safe_nick} - {safe_class}\n"
+        if len(message_text) > 3800:
+            await update.message.reply_text(message_text, parse_mode="Markdown")
+            message_text = ""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆘 Показать ID всех пользователей", callback_data="show_all_ids")]
+    ])
+    await update.message.reply_text(message_text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def show_all_ids_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    users = get_all_users()
+    if not users:
+        await query.edit_message_text("Нет пользователей.")
+        return
+    text = "🆔 *ID всех пользователей:*\n\n"
+    for uid, nick, user_class, _ in users:
+        safe_nick = escape_md(nick)
+        safe_class = escape_md(user_class if user_class else "Не указан")
+        text += f"• {safe_nick} - {safe_class} - `{uid}`\n"
+        if len(text) > 3800:
+            await query.edit_message_text(text, parse_mode="Markdown")
+            return
+    await query.edit_message_text(text, parse_mode="Markdown")
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # ---------- ОТМЕНА (только для остальных состояний) ----------
     if text == "❌ Отмена":
         if context.user_data.get('cash_order'):
             del context.user_data['cash_order']
@@ -1802,25 +1725,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('reject_mode', None)
             await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
             return
-        # Если ничего не подошло – просто игнорируем, не делаем return!
-        # Это позволит дойти до проверки admin_poll_step
 
-    # ---------- РУЧНОЙ ОПРОС АДМИНОМ (включая отмену) ----------
     if context.user_data.get('admin_poll_step') == 'awaiting_input':
         await handle_admin_poll_text(update, context)
         return
 
-    # ---------- РЕДАКТИРОВАНИЕ КЛАССА ----------
     if context.user_data.get('edit_class_mode'):
         await handle_edit_class(update, context)
         return
 
-    # ---------- ВЫБОР АКТИВНОСТИ ----------
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
         return
 
-    # ---------- РЕГИСТРАЦИЯ: НИК ----------
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
         if is_nick_taken(nick):
@@ -1832,7 +1749,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Отлично! Теперь выберите класс вашего персонажа:", reply_markup=get_class_keyboard())
         return
 
-    # ---------- РЕГИСТРАЦИЯ: КЛАСС ----------
     if context.user_data.get('awaiting_class'):
         valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         if text in valid_classes:
@@ -1857,14 +1773,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
 
-    # ---------- ПРОВЕРКА ВАЛИДНОСТИ ----------
     if not is_user_valid(user_id):
         await update.message.reply_text(
             "❌ Вы не зарегистрированы. Нажмите /start для регистрации."
         )
         return
 
-    # ---------- ОСНОВНОЕ МЕНЮ ----------
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1914,12 +1828,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📊 Управление опросами" and is_admin(user_id):
         await update.message.reply_text("Управление опросами:", reply_markup=get_polls_management_keyboard())
     elif text == "📝 Создать опрос (ГВГ)" and is_admin(user_id):
-        context.user_data['poll_creation'] = {'step': 'text'}
-        keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-        await update.message.reply_text(
-            "Введите текст объявления для ГВГ-опроса.\n\nДля отмены нажмите «❌ Отмена».",
-            reply_markup=keyboard
-        )
+        await start_gvg_poll_creation(update, context)
+        return
     elif text == "👥 Пройти за другого" and is_admin(user_id):
         await admin_poll_for_other(update, context)
     elif text == "📤 Разослать опрос" and is_admin(user_id):
@@ -1961,55 +1871,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await confirm_all_pending_command(update, context)
     elif text == "❌ Отказать" and is_admin(user_id):
         await reject_pending_menu(update, context)
-    elif text == "💰 Расчет ЗП" and is_admin(user_id):   # <-- ДОБАВЛЕНА ОБРАБОТКА КНОПКИ
+    elif text == "💰 Расчет ЗП" and is_admin(user_id):
         await calculate_salaries(update, context)
         return
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
-        
-# ---------- СОЗДАНИЕ ОПРОСА (ГВГ) ----------
+
 async def handle_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id) or 'poll_creation' not in context.user_data:
-        return
-    data = context.user_data['poll_creation']
-    text = update.message.text
-    if text == "❌ Отмена":
-        del context.user_data['poll_creation']
-        await update.message.reply_text("Создание опроса отменено.", reply_markup=get_polls_management_keyboard())
-        return
-    if data['step'] == 'text':
-        data['text'] = text
-        data['meetings'] = []
-        data['step'] = 'meeting'
-        await update.message.reply_text(
-            "Теперь вводите названия встреч (ГВГ) по одной строке.\nКогда закончите, нажмите кнопку «✅ Завершить создание» под сообщением.\n\nДля отмены отправьте «❌ Отмена»."
-        )
-    elif data['step'] == 'meeting':
-        data['meetings'].append(text.strip())
-        await update.message.reply_text(
-            f"➕ Добавлена встреча: {text}. Введите следующую или нажмите кнопку ниже для завершения.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Завершить создание", callback_data="finish_poll_creation")]])
-        )
+    return
 
-async def finish_poll_creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    if not is_admin(user_id) or 'poll_creation' not in context.user_data:
-        await query.edit_message_text("Нет активного процесса создания опроса.")
-        return
-    data = context.user_data['poll_creation']
-    if data.get('step') != 'meeting' or not data.get('meetings'):
-        await query.edit_message_text("Вы не добавили ни одной встречи. Опрос не создан.")
-        return
-    create_poll(data['text'], data['meetings'])
-    meetings_list = ", ".join([f'"{m}"' for m in data['meetings']])
-    await query.edit_message_text(f"✅ Опрос (ГВГ) создан!\n\nГВГ: {meetings_list}")
-    del context.user_data['poll_creation']
-    await query.message.reply_text("Управление опросами:", reply_markup=get_polls_management_keyboard())
-
-# ---------- РАССЫЛКА ОПРОСА ----------
 async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -2161,7 +2031,6 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
-# ---------- ОБЩИЕ КОМАНДЫ ----------
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_valid(user_id):
@@ -2179,44 +2048,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Создание опроса отменено.")
     else:
         await update.message.reply_text("Нет активного процесса создания опроса.")
-
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    users = get_all_users()
-    if not users:
-        await update.message.reply_text("Нет пользователей.")
-        return
-
-    message_text = "📋 *Список пользователей:*\n\n"
-    for uid, nick, user_class, _ in users:
-        message_text += f"• {nick} - {user_class}\n"
-        if len(message_text) > 3800:
-            await update.message.reply_text(message_text, parse_mode="Markdown")
-            message_text = ""
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆘 Показать ID всех пользователей", callback_data="show_all_ids")]
-    ])
-
-    await update.message.reply_text(message_text, parse_mode="Markdown", reply_markup=keyboard)
-    
-async def show_all_ids_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    users = get_all_users()
-    if not users:
-        await query.edit_message_text("Нет пользователей.")
-        return
-    text = "🆔 *ID всех пользователей:*\n\n"
-    for uid, nick, user_class, _ in users:
-        text += f"• {nick} - {user_class} - `{uid}`\n"
-        if len(text) > 3800:
-            await query.edit_message_text(text, parse_mode="Markdown")
-            return
-    await query.edit_message_text(text, parse_mode="Markdown")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('activity_mode') and not context.user_data.get('activity_step'):
@@ -2256,13 +2087,16 @@ def main():
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_"))
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
-    app.add_handler(CallbackQueryHandler(finish_poll_creation_callback, pattern="^finish_poll_creation"))
+    # Удалена строка с finish_poll_creation_callback
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
+    app.add_handler(CallbackQueryHandler(gvg_callback, pattern="^(gvg_add_more|gvg_finish)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_gvg_poll_creation), group=2)
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
     app.add_handler(CommandHandler("calc_salary", calculate_salaries))
     app.add_handler(CommandHandler("sync_pa", sync_pa_command))
+
     print("Бот запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
 
