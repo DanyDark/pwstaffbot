@@ -1398,7 +1398,7 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
         "`НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 \\ ОТВЕТ_3 ...`\n\n"
         f"Количество ответов должно быть равно количеству встреч в опросе ({len(poll['meetings'])}):\n"
         f"{', '.join(poll['meetings'])}\n\n"
-        "Пример: `Qudas \\ СИН \\ Да \\ Нет \\ Не знаю`\n\n"
+        "Пример: `Qudas \\ СИН \\ Буду \\ Не буду \\ Не знаю`\n\n"
         "Для отмены нажмите «❌ Отмена».",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -1725,19 +1725,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop('reject_mode', None)
             await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
             return
+        if context.user_data.get('edit_nick_mode'):
+            context.user_data.pop('edit_nick_mode', None)
+            context.user_data.pop('edit_old_nick', None)
+            context.user_data.pop('edit_target_user_id', None)
+            await update.message.reply_text("Редактирование ника отменено.", reply_markup=get_main_keyboard(user_id))
+            return
+        # Если ничего не подошло – игнорируем
 
+    # Ручной опрос админом
     if context.user_data.get('admin_poll_step') == 'awaiting_input':
         await handle_admin_poll_text(update, context)
         return
 
+    # Редактирование класса
     if context.user_data.get('edit_class_mode'):
         await handle_edit_class(update, context)
         return
 
+    # Редактирование ника (ДОБАВЛЕНО)
+    if context.user_data.get('edit_nick_mode'):
+        await handle_edit_nick(update, context)
+        return
+
+    # Выбор активности
     if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
         await handle_activity_choice(update, context)
         return
 
+    # Регистрация: ник
     if context.user_data.get('awaiting_nick'):
         nick = text.strip()
         if is_nick_taken(nick):
@@ -1749,6 +1765,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Отлично! Теперь выберите класс вашего персонажа:", reply_markup=get_class_keyboard())
         return
 
+    # Регистрация: класс
     if context.user_data.get('awaiting_class'):
         valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
         if text in valid_classes:
@@ -1773,12 +1790,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
 
+    # Проверка валидности
     if not is_user_valid(user_id):
         await update.message.reply_text(
             "❌ Вы не зарегистрированы. Нажмите /start для регистрации."
         )
         return
 
+    # Основное меню
     if text == "👤 Мой профиль":
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
@@ -1913,8 +1932,8 @@ async def send_first_question(chat_id: int, poll: dict, context: ContextTypes.DE
     first_meeting = meetings[0]
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Да", callback_data=f"poll_{poll['id']}_{first_meeting}_да_1"),
-            InlineKeyboardButton("❌ Нет", callback_data=f"poll_{poll['id']}_{first_meeting}_нет_1"),
+            InlineKeyboardButton("✅ Буду", callback_data=f"poll_{poll['id']}_{first_meeting}_да_1"),
+            InlineKeyboardButton("❌ Не буду", callback_data=f"poll_{poll['id']}_{first_meeting}_нет_1"),
             InlineKeyboardButton("❓ Не знаю", callback_data=f"poll_{poll['id']}_{first_meeting}_не знаю_1")
         ]
     ])
@@ -2087,7 +2106,6 @@ def main():
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_"))
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
-    # Удалена строка с finish_poll_creation_callback
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(CallbackQueryHandler(gvg_callback, pattern="^(gvg_add_more|gvg_finish)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
