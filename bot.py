@@ -1307,42 +1307,6 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text(f'Регистрация подтверждена, но синхронизация таблицы не выполнена: {e}. Повторите /sync_pa после исправления.')
     await update.message.reply_text(f"✅ Подтверждено {count} пользователей. Они теперь зарегистрированы.")
 
-# ---------- ПЛАНИРОВЩИК ОБЪЯВЛЕНИЙ (БОССЫ) ----------
-async def send_announcement_to_all(text):
-    users = get_all_users()
-    for uid, _, _, _ in users:
-        try:
-            await app.bot.send_message(chat_id=uid, text=text)
-        except Exception as e:
-            logging.error(f"Не удалось отправить объявление {uid}: {e}")
-
-async def create_boss_announcement(boss_name, day_of_week, time_str):
-    text = f"📢 *{boss_name} сегодня!*\nСбор в {time_str}.\n\nУчаствуйте!"
-    await send_announcement_to_all(text)
-
-def schedule_boss_announcements(scheduler):
-    scheduler.add_job(
-        create_boss_announcement,
-        'cron',
-        day_of_week='wed',
-        hour=11,
-        minute=0,
-        args=("Комендант", "среду", "20:45"),
-        id="komendant_announce",
-        timezone='Europe/Moscow'
-    )
-    scheduler.add_job(
-        create_boss_announcement,
-        'cron',
-        day_of_week='sun',
-        hour=11,
-        minute=0,
-        args=("Баньши", "воскресенье", "15:40"),
-        id="banyshi_announce",
-        timezone='Europe/Moscow'
-    )
-    logging.info("Планировщик объявлений о боссах запущен")
-
 # ---------- РУЧНОЙ ОПРОС АДМИНОМ ЗА ДРУГОГО ----------
 async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2209,14 +2173,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- ЗАПУСК ----------
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone='Europe/Moscow')
-    schedule_boss_announcements(scheduler)
     scheduler.add_job(refresh_activity_month, 'cron', hour=0, minute=0,
                       id='activity_month_midnight', coalesce=True, misfire_grace_time=3600)
     scheduler.add_job(refresh_activity_month, 'interval', hours=1,
                       id='activity_month_retry', coalesce=True, max_instances=1)
     scheduler.start()
     app.bot_data['scheduler'] = scheduler
-    logging.info("Планировщик объявлений запущен")
+    logging.info("Планировщик обновления таблицы запущен")
     await refresh_activity_month()
 
 def build_application():

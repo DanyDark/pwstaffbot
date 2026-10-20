@@ -220,12 +220,13 @@ class AutomaticBotFlows(unittest.IsolatedAsyncioTestCase):
     async def test_startup_runs_sync_and_registers_midnight_and_retry_jobs(self):
         scheduler = Mock()
         self.ns['AsyncIOScheduler'] = Mock(return_value=scheduler)
-        self.ns['schedule_boss_announcements'] = Mock()
         self.ns['refresh_activity_month'] = AsyncMock()
         app = SimpleNamespace(bot_data={})
         await self.ns['post_init'](app)
         self.ns['refresh_activity_month'].assert_awaited_once()
         midnight, retry = scheduler.add_job.call_args_list
+        self.assertTrue(all(call.args[0] is self.ns['refresh_activity_month']
+                            for call in scheduler.add_job.call_args_list))
         self.assertEqual(midnight.args[1], 'cron')
         self.assertEqual((midnight.kwargs['hour'], midnight.kwargs['minute']), (0, 0))
         self.assertEqual(retry.args[1], 'interval')
