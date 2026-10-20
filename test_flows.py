@@ -10,7 +10,9 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
+import sheet_layout as attendance
+from test_sheet_layout import Worksheet
 
 
 def load_functions():
@@ -25,6 +27,7 @@ def load_functions():
         ):
             nodes.append(node)
     namespace = dict(sqlite3=sqlite3, os=os, logging=logging, closing=closing,
+                     asyncio=asyncio, attendance=attendance,
                      KeyboardButton=lambda text: text,
                      ReplyKeyboardMarkup=lambda rows, **kwargs: rows)
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), 'bot.py', 'exec'), namespace)
@@ -153,6 +156,30 @@ class BotFlows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ['PlayerOne', 'PlayerTwo'])
         self.assertTrue(post.call_args.kwargs['data']['base64Image'].startswith('data:image/jpeg;'))
         response.raise_for_status.assert_called_once()
+
+    async def test_attendance_requires_date_leader_and_confirmation(self):
+        ws = Worksheet('Активность 10.2026 (136)')
+        self.ns['get_current_activity_sheet'] = lambda: ws
+        with patch.object(attendance, 'moscow_month', return_value=(2026,10)):
+            self.context.user_data.update(activity_mode=True, activity_nicks=['Leader','Player'],
+                activity_sheet=ws.title, activity_step='select_activity')
+            for text in ('ГВГ','20.10.2026','Leader'):
+                self.update.message.text = text
+                await self.ns['handle_activity_choice'](self.update,self.context)
+                self.assertEqual(ws.updates, [])
+            self.assertEqual(self.context.user_data['activity_step'], 'confirm')
+            self.update.message.text = '✅ Записать'
+            await self.ns['handle_activity_choice'](self.update,self.context)
+        self.assertEqual(len(ws.updates),2)
+        self.assertEqual(ws.rows[4][31],'2')
+        self.assertNotIn('activity_mode',self.context.user_data)
+
+    async def test_salary_is_read_from_table_without_writes(self):
+        ws = Worksheet()
+        self.ns['get_current_activity_sheet'] = lambda: ws
+        _, values = self.ns['salary_summary']('Leader')
+        self.assertEqual(values,['Leader: 1/2 — 100000; 2/2 — 200000'])
+        self.assertEqual(ws.updates,[])
 
 
 if __name__ == '__main__':

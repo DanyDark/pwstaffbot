@@ -6,6 +6,7 @@ import traceback
 import requests
 import base64
 import asyncio
+import sheet_layout as attendance
 from contextlib import closing
 from datetime import datetime, time
 from io import BytesIO
@@ -476,281 +477,99 @@ def get_google_spreadsheet():
         return None
 
 def get_or_create_monthly_activity_sheet(spreadsheet):
-    try:
-        template = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
-    except gspread.WorksheetNotFound:
-        logging.error("Лист 'ШАБЛОН АКТИВНОСТИ' не найден в Google Sheets. Создайте его вручную.")
-        raise Exception("Отсутствует шаблон активности")
-    now = datetime.now()
-    year = now.year
-    month = now.month
-    sheet_name = f"Активность {month:02d}.{year}"
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT sheet_name FROM activity_months WHERE year = ? AND month = ?", (year, month))
-    row = cursor.fetchone()
-    if row:
-        try:
-            ws = spreadsheet.worksheet(row[0])
-            conn.close()
-            return ws
-        except gspread.WorksheetNotFound:
-            logging.warning(f"Лист {row[0]} не найден, пересоздаём")
-    new_ws = template.duplicate(insert_sheet_index=0, new_sheet_name=sheet_name)
-    cursor.execute("INSERT INTO activity_months (year, month, sheet_name) VALUES (?, ?, ?)", (year, month, sheet_name))
-    conn.commit()
-    conn.close()
-    return new_ws
+    year, month = attendance.moscow_month()
+    return attendance.ensure_month(spreadsheet, year, month)
+
 
 def get_current_activity_sheet():
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
-        raise Exception("Не удалось подключиться к Google Sheets")
+        raise ValueError("Проверьте GOOGLE_CREDS, GOOGLE_SHEET_ID и доступ редактора к таблице.")
     return get_or_create_monthly_activity_sheet(spreadsheet)
 
+
 def find_column_by_header(ws, header_name):
-    headers = ws.row_values(1)
-    for idx, h in enumerate(headers):
-        if h.strip().lower() == header_name.strip().lower():
-            return idx + 1
-    return None
+    return attendance.layout(ws.get_all_values())['headers'].get(attendance.label(header_name))
+
 
 def find_nick_column(ws):
-    headers = ws.row_values(1)
-    for idx, h in enumerate(headers):
-        if h.strip().lower() == "ник":
-            return idx + 1
-    return None
+    return find_column_by_header(ws, 'НИК')
 
-ACTIVITY_COLUMNS = {
-    "Комендант": (3, 7),
-    "Баньши": (8, 11),
-    "ГВГ": (12, 15)
-}
 
 def get_available_activities(ws):
-    return list(ACTIVITY_COLUMNS.keys())
+    return list(attendance.EVENTS)
 
-def mark_activity_in_sheet(ws, activity_name, nicks):
-    nick_col = find_nick_column(ws)
-    if nick_col is None:
-        raise Exception("В листе не найден столбец 'НИК'")
-    if activity_name not in ACTIVITY_COLUMNS:
-        raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
-    start_col, end_col = ACTIVITY_COLUMNS[activity_name]
-    all_values = ws.get_all_values()
-    updated = 0
-    for row_idx, row in enumerate(all_values[1:], start=2):
-        if len(row) < nick_col:
-            continue
-        nick_in_sheet = row[nick_col-1].strip()
-        if not nick_in_sheet:
-            continue
-        if nick_in_sheet.lower() not in [n.lower() for n in nicks]:
-            continue
-        for col in range(start_col, end_col+1):
-            if len(row) >= col and row[col-1] and row[col-1].strip():
-                continue
-            ws.update_cell(row_idx, col, "БЫЛ")
-            updated += 1
-            break
-    return updated
 
 def get_user_activity_count(nick):
-    try:
-        ws = get_current_activity_sheet()
-        nick_col = find_nick_column(ws)
-        if nick_col is None:
-            return 0
-        all_values = ws.get_all_values()
-        count = 0
-        for row in all_values[1:]:
-            if len(row) >= nick_col and row[nick_col-1].strip().lower() == nick.lower():
-                for col_idx, val in enumerate(row):
-                    if col_idx != nick_col-1 and val == "БЫЛ":
-                        count += 1
-                break
-        return count
-    except Exception as e:
-        logging.error(f"Ошибка подсчёта активности для {nick}: {e}")
-        return 0
+    rows = get_current_activity_sheet().get_all_values()
+    spec = attendance.layout(rows)
+    for row, name in attendance.players(rows, spec):
+        if name.casefold() == nick.casefold():
+            return sum(str(attendance.cell(rows[row - 1], col)).strip() in ('1', '2')
+                       for cols in spec['events'].values() for col in cols)
+    return 0
+
+
+def salary_summary(nick=None):
+    ws = get_current_activity_sheet()
+    rows = ws.get_all_values()
+    spec = attendance.layout(rows)
+    first = spec['headers'].get('ЗП 1/2')
+    second = spec['headers'].get('ЗП 2/2')
+    if not first or not second:
+        raise ValueError('В таблице нет столбцов «зп 1/2» и «зп 2/2».')
+    result = []
+    for row, name in attendance.players(rows, spec):
+        if nick is None or nick.casefold() == name.casefold():
+            result.append(f"{name}: 1/2 — {attendance.cell(rows[row - 1], first) or '0'}; "
+                          f"2/2 — {attendance.cell(rows[row - 1], second) or '0'}")
+    return ws.title, result
+
 
 async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("Доступно только администратору.")
         return
     try:
-        ws = get_current_activity_sheet()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
-        return
-    nick_col = find_column_by_header(ws, "НИК")
-    salary_col = find_column_by_header(ws, "Общая ЗП")
-    if nick_col is None or salary_col is None:
-        await update.message.reply_text("❌ В листе не найдены столбцы 'НИК' или 'Общая ЗП'.")
-        return
-    all_values = ws.get_all_values()
-    if len(all_values) < 2:
-        await update.message.reply_text("Нет данных для расчета.")
-        return
-    updates = []
-    updated_rows = 0
-    for row_idx, row in enumerate(all_values[1:], start=2):
-        nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
-        if not nick:
-            continue
-        total_salary = 0
-        for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
-            for col in range(start_col, end_col+1):
-                if len(row) >= col:
-                    cell_value = row[col-1].strip()
-                    if cell_value == "БЫЛ":
-                        total_salary += 10_000_000
-                    elif cell_value == "БЫЛ ПЛ":
-                        total_salary += 20_000_000
-        updates.append({
-            'range': f'{chr(64 + salary_col)}{row_idx}',
-            'values': [[total_salary]]
-        })
-        updated_rows += 1
-    if updates:
-        ws.batch_update(updates)
-        await update.message.reply_text(f"✅ Расчет ЗП завершен.\nОбновлено строк: {updated_rows}")
-    else:
-        await update.message.reply_text("Нет строк для обновления.")
+        title, result = await asyncio.to_thread(salary_summary)
+        await update.message.reply_text(f"💰 {title}. Зарплата по формулам таблицы:")
+        # Keep messages within Telegram's limit without changing the formulas.
+        chunk = ''
+        for line in result:
+            if len(chunk) + len(line) > 3500:
+                await update.message.reply_text(chunk)
+                chunk = ''
+            chunk += line + '\n'
+        await update.message.reply_text(chunk or 'Нет игроков в таблице.')
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Не удалось прочитать зарплату: {exc}")
 
-async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
-        return
-    users = get_all_users()
-    if not users:
-        await update.message.reply_text("Нет зарегистрированных пользователей.")
-        return
-    class_mapping = CLASS_SHEET_SECTIONS
-    section_order = list(CLASS_SHEET_SECTIONS.values())
-    grouped = {section: [] for section in section_order}
-    for uid, nick, user_class, _ in users:
-        section = class_mapping.get(user_class.upper())
-        if section:
-            grouped[section].append(nick)
-        else:
-            logging.warning(f"Неизвестный класс: {user_class}")
-    for section in grouped:
-        grouped[section].sort()
-    spreadsheet = get_google_spreadsheet()
-    if not spreadsheet:
-        await update.message.reply_text("❌ Не удалось подключиться к Google Sheets.")
-        return
-    try:
-        ws = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
-    except gspread.WorksheetNotFound:
-        await update.message.reply_text("❌ Лист 'ШАБЛОН АКТИВНОСТИ' не найден. Создайте его вручную.")
-        return
-    all_values = ws.get_all_values()
-    header_rows = {}
-    for idx, row in enumerate(all_values, start=1):
-        if len(row) >= 2:
-            cell_value = row[1].strip()
-            if cell_value in section_order:
-                header_rows[cell_value] = idx
-    missing_sections = [s for s in section_order if s not in header_rows]
-    if missing_sections:
-        await update.message.reply_text(f"⚠️ В шаблоне не найдены разделы: {', '.join(missing_sections)}. Добавьте их вручную.")
-        return
-    total_updated = 0
-    for idx, section in enumerate(section_order):
-        header_row = header_rows[section]
-        next_header_row = header_rows.get(section_order[idx+1]) if idx+1 < len(section_order) else None
-        if next_header_row:
-            available_rows = next_header_row - header_row - 1
-        else:
-            available_rows = len(all_values) - header_row
-        nicks = grouped.get(section, [])
-        needed_rows = len(nicks)
-        if needed_rows > available_rows:
-            rows_to_insert = needed_rows - available_rows
-            if next_header_row:
-                insert_index = next_header_row
-            else:
-                insert_index = len(all_values) + 1
-            for _ in range(rows_to_insert):
-                ws.insert_rows(insert_index, amount=1)
-            all_values = ws.get_all_values()
-            for s in section_order[idx+1:]:
-                if s in header_rows:
-                    header_rows[s] += rows_to_insert
-        start_row = header_row + 1
-        for i, nick in enumerate(nicks):
-            ws.update_cell(start_row + i, 2, nick)
-            total_updated += 1
-    await update.message.reply_text(f"✅ Синхронизация завершена.\nОбновлено ников: {total_updated}")
 
 def sync_pa_internal():
-    users = get_all_users()
-    if not users:
-        return
-    class_mapping = CLASS_SHEET_SECTIONS
-    section_order = list(CLASS_SHEET_SECTIONS.values())
-    grouped = {section: [] for section in section_order}
-    for uid, nick, user_class, _ in users:
-        section = class_mapping.get(user_class.upper())
-        if section:
-            grouped[section].append(nick)
-        else:
-            logging.warning(f"Неизвестный класс: {user_class}")
-    for section in grouped:
-        grouped[section].sort()
-    spreadsheet = get_google_spreadsheet()
-    if not spreadsheet:
-        logging.error("Не удалось подключиться к Google Sheets для синхронизации шаблона")
+    return attendance.sync_players(get_current_activity_sheet(), get_all_users())
+
+
+async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Доступно только администратору.")
         return
     try:
-        ws = spreadsheet.worksheet("ШАБЛОН АКТИВНОСТИ")
-    except gspread.WorksheetNotFound:
-        logging.error("Лист 'ШАБЛОН АКТИВНОСТИ' не найден")
+        count = await asyncio.to_thread(sync_pa_internal)
+        await update.message.reply_text(f"✅ Добавлено игроков в текущий месяц: {count}.")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Синхронизация не выполнена: {exc}")
+
+
+async def sync_registered_profile(update, user_id):
+    if not globals().get('GOOGLE_CREDS_JSON') or not globals().get('GOOGLE_SHEET_ID'):
         return
-    all_values = ws.get_all_values()
-    header_rows = {}
-    for idx, row in enumerate(all_values, start=1):
-        if len(row) >= 2:
-            cell_value = row[1].strip()
-            if cell_value in section_order:
-                header_rows[cell_value] = idx
-    missing_sections = [s for s in section_order if s not in header_rows]
-    if missing_sections:
-        logging.warning(f"В шаблоне не найдены разделы: {', '.join(missing_sections)}")
-        return
-    total_updated = 0
-    for idx, section in enumerate(section_order):
-        header_row = header_rows[section]
-        next_header_row = header_rows.get(section_order[idx+1]) if idx+1 < len(section_order) else None
-        if next_header_row:
-            available_rows = next_header_row - header_row - 1
-        else:
-            available_rows = len(all_values) - header_row
-        nicks = grouped.get(section, [])
-        needed_rows = len(nicks)
-        if needed_rows > available_rows:
-            rows_to_insert = needed_rows - available_rows
-            if next_header_row:
-                insert_index = next_header_row
-            else:
-                insert_index = len(all_values) + 1
-            for _ in range(rows_to_insert):
-                ws.insert_rows(insert_index, amount=1)
-            all_values = ws.get_all_values()
-            for s in section_order[idx+1:]:
-                if s in header_rows:
-                    header_rows[s] += rows_to_insert
-        start_row = header_row + 1
-        for i, nick in enumerate(nicks):
-            ws.update_cell(start_row + i, 2, nick)
-            total_updated += 1
-    logging.info(f"Синхронизация шаблона завершена. Обновлено ников: {total_updated}")
-    return total_updated
+    try:
+        users = [user for user in get_all_users() if user[0] == user_id]
+        ws = await asyncio.to_thread(get_current_activity_sheet)
+        await asyncio.to_thread(attendance.sync_players, ws, users)
+    except Exception as exc:
+        await update.message.reply_text(f"Профиль сохранён, но не добавлен в таблицу: {exc}")
+
 
 # ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
 def get_responses_grouped_by_meeting(poll_id):
@@ -1089,7 +908,7 @@ async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['activity_mode'] = True
     keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
     await update.message.reply_text(
-        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность.\n\nДоступные активности: Комендант, Баньши, ГВГ.\n\nДля отмены нажмите «❌ Отмена».",
+        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность.\n\nДоступные активности: РБ, Комендант, Баньши, ГВГ.\n\nДля отмены нажмите «❌ Отмена».",
         reply_markup=keyboard
     )
 
@@ -1108,152 +927,96 @@ def sort_sheet_by_class(worksheet):
         worksheet.update(values=new_values, range_name='A1')
 
 async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('activity_mode'):
+    if not is_admin(update.effective_user.id) or not context.user_data.get('activity_mode'):
         return
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-    if not update.message.photo:
-        await update.message.reply_text("Пожалуйста, отправьте фото (скриншот).")
-        return
-    photo_file = await update.message.photo[-1].get_file()
-    image_bytes = await photo_file.download_as_bytearray()
-    await update.message.reply_text("🔍 Распознаю ники на изображении...")
     try:
-        raw_nicks = await asyncio.to_thread(extract_nicks_from_image, bytes(image_bytes))
-    except ValueError as exc:
-        await update.message.reply_text(str(exc))
-        return
-    if not raw_nicks:
-        await update.message.reply_text("Не удалось распознать ни одного ника.")
-        return
-    users = get_all_users()
-    known_nicks = [nick for _, nick, _, _ in users]
-    final_ordered_nicks = []
-    matched_count = 0
-    unmatched_nicks = []
-    for rn in raw_nicks:
-        best_match = None
-        best_ratio = 0
-        for kn in known_nicks:
-            ratio = fuzz.ratio(rn.lower(), kn.lower())
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match = kn
-        if best_ratio >= 70 and best_match:
-            final_ordered_nicks.append(best_match)
-            matched_count += 1
-        else:
-            final_ordered_nicks.append(rn)
-            unmatched_nicks.append(rn)
-    context.user_data['activity_nicks'] = final_ordered_nicks
-    context.user_data['activity_raw'] = raw_nicks
-    context.user_data['activity_matched_count'] = matched_count
-    context.user_data['activity_unmatched'] = unmatched_nicks
-    if not final_ordered_nicks:
-        await update.message.reply_text("Не удалось распознать ни одного ника после сопоставления.")
-        return
-    stats = f"✅ Распознано: {len(raw_nicks)} ников.\n" \
-            f"🎯 Совпало с зарегистрированными: {matched_count}.\n" \
-            f"❓ Не распознано (будут записаны как есть): {len(unmatched_nicks)}.\n\n"
-    if unmatched_nicks:
-        stats += f"Неопознанные: {', '.join(unmatched_nicks)}\n\n"
-    activities = ["Комендант", "Баньши", "ГВГ"]
-    keyboard = []
-    for act in activities:
-        keyboard.append([KeyboardButton(act)])
-    keyboard.append([KeyboardButton("❌ Отмена")])
-    await update.message.reply_text(
-        stats + f"Список для записи (в порядке скриншота): {', '.join(final_ordered_nicks)}\n\nВыберите активность:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-    context.user_data['activity_step'] = 'select_activity'
+        photo_file = await update.message.photo[-1].get_file()
+        image = await photo_file.download_as_bytearray()
+        await update.message.reply_text("🔍 Распознаю ники...")
+        raw = await asyncio.to_thread(extract_nicks_from_image, bytes(image))
+        if not raw:
+            await update.message.reply_text("Ники не распознаны. Пришлите более чёткий скриншот списка игроков.")
+            return
+        ws = await asyncio.to_thread(get_current_activity_sheet)
+        rows = await asyncio.to_thread(ws.get_all_values)
+        known = [nick for _, nick in attendance.players(rows)]
+        matched, unmatched = fuzzy_match_nicks(raw, known, threshold=80)
+        nicks = list(dict.fromkeys(matched[r] for r in raw if r in matched))
+        if not nicks:
+            await update.message.reply_text("Распознанные ники не найдены в месячной таблице. Проверьте состав игроков.")
+            return
+        context.user_data.update(activity_nicks=nicks, activity_sheet=ws.title,
+                                 activity_step='select_activity')
+        await update.message.reply_text(
+            "Проверьте распознанных игроков:\n" + ', '.join(nicks)
+            + ("\nНе сопоставлены и не будут записаны: " + ', '.join(unmatched) if unmatched else '')
+            + "\nВыберите событие. Запись будет только после подтверждения.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(e)] for e in attendance.EVENTS]
+                                             + [[KeyboardButton("❌ Отмена")]], resize_keyboard=True))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Распознавание не завершено: {exc}")
+
 
 async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('activity_mode') or context.user_data.get('activity_step') != 'select_activity':
+    if not is_admin(update.effective_user.id):
         return
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-    activity = update.message.text
-    if activity == "❌ Отмена":
-        context.user_data.pop('activity_mode', None)
-        context.user_data.pop('activity_step', None)
-        context.user_data.pop('activity_nicks', None)
-        await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
-        return
-    nicks = context.user_data.get('activity_nicks', [])
-    if not nicks:
-        await update.message.reply_text("Нет распознанных ников. Попробуйте заново.")
-        context.user_data.pop('activity_mode', None)
-        context.user_data.pop('activity_step', None)
-        return
+    state = context.user_data
+    text = update.message.text.strip()
     try:
-        ws = await asyncio.to_thread(get_current_activity_sheet)
-        updated = await asyncio.to_thread(mark_activity_in_sheet_with_pl, ws, activity, nicks, threshold=70)
-        nick_col = find_column_by_header(ws, "НИК")
-        all_nicks_in_sheet = []
-        if nick_col:
-            all_vals = ws.get_all_values()
-            all_nicks_in_sheet = [row[nick_col-1].strip() for row in all_vals[1:] if row and len(row) >= nick_col and row[nick_col-1].strip()]
-        not_found = []
-        for recognized_nick in nicks:
-            best_ratio = 0
-            for table_nick in all_nicks_in_sheet:
-                ratio = fuzz.ratio(recognized_nick.lower(), table_nick.lower())
-                if ratio > best_ratio:
-                    best_ratio = ratio
-            if best_ratio < 70:
-                not_found.append(recognized_nick)
-        await update.message.reply_text(
-            f"✅ Готово!\nАктивность: {activity}\nПоставлено отметок: {updated}\nРаспознано ников: {len(nicks)}"
-            + (f"\n⚠️ Не найдены в таблице: {', '.join(not_found)}" if not_found else ""),
-            reply_markup=get_main_keyboard(user_id)
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при записи: {e}")
-    finally:
-        context.user_data.pop('activity_mode', None)
-        context.user_data.pop('activity_step', None)
-        context.user_data.pop('activity_nicks', None)
+        year, month = attendance.moscow_month()
+        step = state.get('activity_step')
+        if step == 'select_activity':
+            if text not in attendance.EVENTS:
+                await update.message.reply_text('Выберите событие из кнопок.')
+                return
+            ws = await asyncio.to_thread(get_current_activity_sheet)
+            if ws.title != state['activity_sheet']:
+                raise ValueError('Месяц сменился. Пришлите скриншот заново.')
+            rows = await asyncio.to_thread(ws.get_all_values)
+            dates = attendance.event_dates(rows, text, year, month)
+            if not dates:
+                raise ValueError('В заголовках события нет дат. Заполните даты в месячном листе.')
+            state.update(activity_event=text, activity_dates=dates, activity_step='select_date')
+            await update.message.reply_text('Выберите дату события:', reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton(d)] for d in dates] + [[KeyboardButton('❌ Отмена')]], resize_keyboard=True))
+        elif step == 'select_date':
+            if text not in state['activity_dates']:
+                await update.message.reply_text('Выберите дату из кнопок.')
+                return
+            state.update(activity_date=text, activity_step='select_leader')
+            await update.message.reply_text('Кто ПЛ? Ему будет поставлено 2, остальным 1.',
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton(n)] for n in state['activity_nicks']]
+                    + [[KeyboardButton('Без ПЛ')], [KeyboardButton('❌ Отмена')]], resize_keyboard=True))
+        elif step == 'select_leader':
+            if text not in state['activity_nicks'] and text != 'Без ПЛ':
+                await update.message.reply_text('Выберите ПЛ из распознанных игроков или «Без ПЛ».')
+                return
+            state.update(activity_leader=None if text == 'Без ПЛ' else text, activity_step='confirm')
+            await update.message.reply_text(
+                f"Лист: {state['activity_sheet']}\n{state['activity_event']} — {state['activity_date']}"
+                + f"\nПЛ: {text}\nИгроки: " + ', '.join(state['activity_nicks']),
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton('✅ Записать')],
+                                                  [KeyboardButton('❌ Отмена')]], resize_keyboard=True))
+        elif step == 'confirm':
+            if text != '✅ Записать':
+                await update.message.reply_text('Подтвердите запись кнопкой или отмените.')
+                return
+            ws = await asyncio.to_thread(get_current_activity_sheet)
+            if ws.title != state['activity_sheet']:
+                raise ValueError('Месяц сменился. Начните заново.')
+            rows = await asyncio.to_thread(ws.get_all_values)
+            dates = attendance.event_dates(rows, state['activity_event'], year, month)
+            col = dates.get(state['activity_date'])
+            if col is None:
+                raise ValueError('Дата удалена из таблицы. Начните заново.')
+            count, missing = await asyncio.to_thread(attendance.mark_attendance, ws, col,
+                state['activity_nicks'], state['activity_leader'])
+            clear_input_state(context)
+            await update.message.reply_text(f"✅ Обновлено отметок: {count}."
+                + (" Не найдены: " + ', '.join(missing) if missing else ''), reply_markup=get_main_keyboard(update.effective_user.id))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Запись не выполнена: {exc}\nМожно отменить операцию и начать заново.")
 
-def mark_activity_in_sheet_with_pl(ws, activity_name, ordered_nicks, threshold=70):
-    nick_col = find_column_by_header(ws, "НИК")
-    if nick_col is None:
-        raise Exception("В листе не найден столбец 'НИК'")
-    if activity_name not in ACTIVITY_COLUMNS:
-        raise Exception(f"Активность '{activity_name}' не поддерживается шаблоном")
-    start_col, end_col = ACTIVITY_COLUMNS[activity_name]
-    all_values = ws.get_all_values()
-    table_nicks = []
-    for row_idx, row in enumerate(all_values[1:], start=2):
-        if len(row) >= nick_col:
-            nick_val = row[nick_col-1].strip()
-            if nick_val:
-                table_nicks.append((row_idx, nick_val))
-    updated = 0
-    for idx, recognized_nick in enumerate(ordered_nicks):
-        is_first = (idx == 0)
-        best_match_row = None
-        best_ratio = 0
-        for row_idx, table_nick in table_nicks:
-            ratio = fuzz.ratio(recognized_nick.lower(), table_nick.lower())
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_match_row = row_idx
-        if best_ratio >= threshold:
-            row_values = ws.row_values(best_match_row)
-            for col in range(start_col, end_col+1):
-                if len(row_values) >= col and row_values[col-1] and row_values[col-1].strip():
-                    continue
-                mark = "БЫЛ ПЛ" if is_first else "БЫЛ"
-                ws.update_cell(best_match_row, col, mark)
-                updated += 1
-                table_nicks = [(r, n) for r, n in table_nicks if r != best_match_row]
-                break
-        else:
-            logging.warning(f"Не найдено соответствие для распознанного ника '{recognized_nick}' (лучшее совпадение {best_ratio}%)")
-    return updated
 
 # ---------- УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ (АДМИН) ----------
 async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1571,44 +1334,14 @@ def get_main_keyboard(user_id):
 async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_user_valid(user_id):
-        await update.message.reply_text("Вы не зарегистрированы. Нажмите /start.")
-        return
-    nick = get_user_nick(user_id)
-    if not nick:
-        await update.message.reply_text("Не удалось определить ваш ник.")
+        await update.message.reply_text('Вы не зарегистрированы. Нажмите /start.')
         return
     try:
-        ws = get_current_activity_sheet()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка доступа к Google Sheets: {e}")
-        return
-    nick_col = find_column_by_header(ws, "НИК")
-    if nick_col is None:
-        await update.message.reply_text("❌ В листе не найден столбец 'НИК'.")
-        return
-    all_values = ws.get_all_values()
-    total_salary = 0
-    for row_idx, row in enumerate(all_values[1:], start=2):
-        current_nick = row[nick_col-1].strip() if len(row) >= nick_col else ""
-        if current_nick.lower() != nick.lower():
-            continue
-        for activity_name, (start_col, end_col) in ACTIVITY_COLUMNS.items():
-            for col in range(start_col, end_col+1):
-                if len(row) >= col:
-                    cell_value = row[col-1].strip()
-                    if cell_value == "БЫЛ":
-                        total_salary += 10_000_000
-                    elif cell_value == "БЫЛ ПЛ":
-                        total_salary += 20_000_000
-        break
-    checks = total_salary // 10_000_000
-    await update.message.reply_text(
-        f"💰 *Ваша зарплата за текущий месяц*\n\n"
-        f"Сумма: {total_salary:,} (в игровой валюте)\n"
-        f"Это составляет: *{checks} чеков*\n\n"
-        f"1 чек = 10 000 000",
-        parse_mode="Markdown"
-    )
+        title, result = await asyncio.to_thread(salary_summary, get_user_nick(user_id))
+        await update.message.reply_text(f"💰 {title}\n" + ('\n'.join(result) or 'Ваш ник пока не найден в месячной таблице.'))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Не удалось прочитать зарплату: {exc}")
+
 
 def get_admin_keyboard():
     keyboard = [
@@ -1722,6 +1455,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
         await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
+        await sync_registered_profile(update, user_id)
     elif is_pending(user_id):
         await update.message.reply_text("Ваша заявка на регистрацию уже отправлена администратору. Пожалуйста, ожидайте подтверждения.")
     else:
@@ -1809,7 +1543,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Выбор активности
-    if context.user_data.get('activity_mode') and context.user_data.get('activity_step') == 'select_activity':
+    if context.user_data.get('activity_mode') and context.user_data.get('activity_step'):
         await handle_activity_choice(update, context)
         return
 
@@ -1839,6 +1573,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Администратор зарегистрирован: {nick} ({user_class}).",
                     reply_markup=get_main_keyboard(user_id)
                 )
+                await sync_registered_profile(update, user_id)
                 return
             await update.message.reply_text(
                 f"✅ Заявка на регистрацию отправлена!\nНик: {nick}\nКласс: {user_class}\n\n"
@@ -1877,10 +1612,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not nick:
             await update.message.reply_text("❌ Не удалось определить ваш ник.")
             return
-        activity_count = get_user_activity_count(nick)
+        try:
+            activity_count = await asyncio.to_thread(get_user_activity_count, nick)
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Не удалось прочитать активность: {exc}")
+            return
         await update.message.reply_text(
             f"📊 *Ваша активность*\n\n"
-            f"┌ Всего отметок «БЫЛ»: *{activity_count}*\n"
+            f"┌ Посещено событий: *{activity_count}*\n"
             f"└ (за текущий месяц)\n\n"
             f"💡 *Совет:* больше участвуйте в ГВГ и боссах!",
             parse_mode="Markdown"
