@@ -1,0 +1,140 @@
+"""Offline regression tests: no Telegram requests or production database access."""
+import ast
+import asyncio
+import logging
+import os
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+
+def load_functions():
+    tree = ast.parse(Path(__file__).with_name('bot.py').read_text(encoding='utf-8'))
+    wanted = {'CHARACTER_CLASSES', 'CLASS_SHEET_SECTIONS', 'MENU_PARENTS'}
+    nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nodes.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in wanted for t in node.targets
+        ):
+            nodes.append(node)
+    namespace = dict(sqlite3=sqlite3, os=os, logging=logging, closing=closing,
+                     KeyboardButton=lambda text: text,
+                     ReplyKeyboardMarkup=lambda rows, **kwargs: rows)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), 'bot.py', 'exec'), namespace)
+    return namespace
+
+
+class BotFlows(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ns = load_functions()
+        self.ns.update(DB_FILE=str(Path(self.tmp.name) / 'users.db'), ADMIN_LIST=[1])
+        self.ns['init_db']()
+        self.update = SimpleNamespace(effective_user=SimpleNamespace(id=1),
+                                      message=SimpleNamespace(text='', reply_text=AsyncMock()))
+        self.context = SimpleNamespace(user_data={}, bot=SimpleNamespace(send_message=AsyncMock()))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    async def text(self, text):
+        self.update.message.text = text
+        await self.ns['handle_text'](self.update, self.context)
+
+    async def test_pending_admin_can_start_without_approving_other_players(self):
+        self.ns['add_pending_user'](1, 'Admin', 'ВАР')
+        self.ns['add_pending_user'](2, 'Player', 'МАГ')
+        await self.ns['start'](self.update, self.context)
+        self.assertTrue(self.ns['is_registered'](1))
+        self.assertFalse(self.ns['is_pending'](1))
+        self.assertFalse(self.ns['is_registered'](2))
+        self.assertTrue(self.ns['is_pending'](2))
+        await self.text('📊 Админ-панель')
+        await self.text('📊 Управление опросами')
+        self.assertEqual(self.context.user_data['menu'], 'polls')
+
+    async def test_regular_pending_player_is_not_promoted(self):
+        self.ns['add_pending_user'](2, 'Player', 'МАГ')
+        self.update.effective_user.id = 2
+        await self.ns['start'](self.update, self.context)
+        self.assertFalse(self.ns['is_registered'](2))
+        await self.text('📊 Админ-панель')
+        self.assertNotEqual(self.context.user_data.get('menu'), 'admin')
+
+    async def test_new_admin_registration_is_immediate(self):
+        self.context.user_data.update(awaiting_class=True, temp_nick='Admin')
+        await self.text('ВАР')
+        self.assertTrue(self.ns['is_registered'](1))
+        self.assertFalse(self.ns['is_pending'](1))
+
+    async def test_back_follows_parent_menus(self):
+        self.ns['register_user'](1, 'Admin', 'ВАР')
+        for button in ('📊 Админ-панель', '🏰 Управление кланом', '✏️ Исправить профиль'):
+            await self.text(button)
+        for expected in ('clan', 'admin', 'main'):
+            await self.text('🔙 Назад')
+            self.assertEqual(self.context.user_data['menu'], expected)
+
+    async def test_cancel_clears_all_input_modes(self):
+        self.context.user_data.update(menu='polls', gvg_poll={'step': 'datetime'}, admin_poll_step='awaiting_input')
+        await self.text('❌ Отмена')
+        self.assertEqual(self.context.user_data, {'menu': 'polls'})
+
+    async def test_gvg_text_is_routed_once(self):
+        self.ns['register_user'](1, 'Admin', 'ВАР')
+        self.context.user_data['gvg_poll'] = {'step': 'datetime'}
+        handler = AsyncMock()
+        self.ns['handle_gvg_poll_creation'] = handler
+        await self.text('25.10.2026 19:00')
+        handler.assert_awaited_once()
+
+    async def test_rejection_works_for_registered_admin(self):
+        self.ns['register_user'](1, 'Admin', 'ВАР')
+        self.ns['add_pending_user'](2, 'Player', 'МАГ')
+        self.context.user_data.update(menu='registration', reject_mode=True)
+        await self.text('❌ Player')
+        self.assertFalse(self.ns['is_pending'](2))
+
+    async def test_end_poll_rejects_non_admin(self):
+        self.update.effective_user.id = 2
+        self.ns['deactivate_poll'] = lambda: self.fail('Unauthorized mutation')
+        await self.ns['end_poll_command'](self.update, self.context)
+
+    async def test_new_regular_player_stays_pending(self):
+        self.update.effective_user.id = 2
+        self.context.user_data.update(awaiting_class=True, temp_nick='Player')
+        await self.text('ЛУК')
+        self.assertFalse(self.ns['is_registered'](2))
+        self.assertTrue(self.ns['is_pending'](2))
+
+    async def test_gvg_add_more_sends_reply_keyboard_in_new_message(self):
+        self.context.user_data['gvg_poll'] = {
+            'step': 'waiting_choice', 'datetime': '25.10.2026 19:00', 'opponents': 'Clan'
+        }
+        query = SimpleNamespace(answer=AsyncMock(), from_user=SimpleNamespace(id=1),
+                                data='gvg_add_more', edit_message_reply_markup=AsyncMock(),
+                                message=SimpleNamespace(reply_text=AsyncMock()))
+        self.update.callback_query = query
+        await self.ns['gvg_callback'](self.update, self.context)
+        query.message.reply_text.assert_awaited_once()
+        self.assertEqual(self.context.user_data['gvg_poll']['step'], 'datetime')
+        self.assertEqual(len(self.context.user_data['gvg_poll']['gvg_list']), 1)
+
+    async def test_stale_gvg_finish_does_not_create_poll(self):
+        self.context.user_data['gvg_poll'] = {'step': 'datetime'}
+        self.ns['create_poll'] = lambda *args: self.fail('Incomplete poll created')
+        self.update.callback_query = SimpleNamespace(
+            answer=AsyncMock(), from_user=SimpleNamespace(id=1), data='gvg_finish',
+            message=SimpleNamespace(reply_text=AsyncMock())
+        )
+        await self.ns['gvg_callback'](self.update, self.context)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -6,6 +6,7 @@ import traceback
 import requests
 import base64
 import asyncio
+from contextlib import closing
 from datetime import datetime, time
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -220,6 +221,23 @@ def is_admin(user_id):
 
 def is_user_valid(user_id):
     return is_registered(user_id)
+
+def approve_admin_registration(user_id):
+    """Only configured administrators can approve their own pending profile."""
+    if not is_admin(user_id):
+        return
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (user_id, nick, class) "
+            "SELECT user_id, nick, class FROM pending_users WHERE user_id = ?",
+            (user_id,)
+        )
+        conn.execute(
+            "DELETE FROM pending_users WHERE user_id = ? "
+            "AND EXISTS (SELECT 1 FROM users WHERE user_id = ?)",
+            (user_id, user_id)
+        )
+
 
 # ---------- ЗАЯВКИ НА РЕГИСТРАЦИЮ ----------
 def add_pending_user(user_id, nick, user_class):
@@ -1498,6 +1516,9 @@ async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Сессия создания опроса не найдена.")
         return
     data = context.user_data['gvg_poll']
+    if data.get('step') != 'waiting_choice':
+        await query.message.reply_text("Сначала введите дату и противников текущего ГВГ.")
+        return
     if query.data == "gvg_add_more":
         if 'gvg_list' not in data:
             data['gvg_list'] = []
@@ -1507,10 +1528,11 @@ async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         data['step'] = 'datetime'
         keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-        await query.edit_message_text(
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
             "Введите дату и время следующего ГВГ в формате:\n"
             "`ДД.ММ.ГГГГ ЧЧ:ММ`\n\n"
-            "Для завершения нажмите кнопку «❌ Отмена» и завершите опрос.",
+            "Для отмены создания опроса нажмите «❌ Отмена».",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
@@ -1586,6 +1608,7 @@ async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_admin_keyboard():
     keyboard = [
+        [KeyboardButton("📝 Регистрация")],
         [KeyboardButton("📊 Управление опросами")],
         [KeyboardButton("🏰 Управление кланом")],
         [KeyboardButton("💸 Выдача кеша"), KeyboardButton("🔙 Назад")]
@@ -1626,22 +1649,77 @@ def get_class_keyboard():
     keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
 
+MENU_PARENTS = {
+    "admin": "main", "polls": "admin", "clan": "admin",
+    "registration": "admin", "profile": "clan",
+}
+
+
+def clear_input_state(context):
+    # Keep the menu location, but discard all unfinished input scenarios.
+    menu = context.user_data.get('menu', 'main')
+    context.user_data.clear()
+    context.user_data['menu'] = menu
+
+
+async def show_menu(update, context, menu='main'):
+    user_id = update.effective_user.id
+    if menu != 'main' and not is_admin(user_id):
+        await update.message.reply_text("Доступно только администратору.")
+        return
+    context.user_data['menu'] = menu
+    if menu == 'registration':
+        await registration_menu(update, context)
+    elif menu == 'profile':
+        await edit_profile_menu(update, context)
+    else:
+        menus = {
+            'main': ("Главное меню:", lambda: get_main_keyboard(user_id)),
+            'admin': ("Админ-панель:", get_admin_keyboard),
+            'polls': ("Управление опросами:", get_polls_management_keyboard),
+            'clan': ("Управление кланом:", get_clan_management_keyboard),
+        }
+        title, keyboard = menus[menu]
+        await update.message.reply_text(title, reply_markup=keyboard())
+
+
+async def route_navigation(update, context):
+    text = update.message.text
+    destinations = {
+        "📊 Админ-панель": 'admin', "📊 Управление опросами": 'polls',
+        "🏰 Управление кланом": 'clan', "📝 Регистрация": 'registration',
+        "✏️ Исправить профиль": 'profile',
+    }
+    if text in ("🔙 Назад", "❌ Отмена"):
+        current = context.user_data.get('menu', 'main')
+        # Back/cancel from a form returns to its menu, not its parent.
+        in_form = any(k != 'menu' for k in context.user_data)
+        destination = current if in_form else MENU_PARENTS.get(current, 'main')
+        clear_input_state(context)
+        await show_menu(update, context, destination)
+        return True
+    if text in destinations:
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("Доступно только администратору.")
+            return True
+        clear_input_state(context)
+        await show_menu(update, context, destinations[text])
+        return True
+    return False
+
+
 # ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    clear_input_state(context)
+    context.user_data['menu'] = 'main'
+    approve_admin_registration(user_id)
     if is_registered(user_id):
         nick = get_user_nick(user_id)
         user_class = get_user_class(user_id)
         await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
     elif is_pending(user_id):
-        if is_admin(user_id):
-            await update.message.reply_text(
-                "Ваша заявка ожидает подтверждения. Откройте «📝 Регистрация» "
-                "и проверьте список ожидания перед подтверждением заявок.",
-                reply_markup=get_admin_keyboard()
-            )
-        else:
-            await update.message.reply_text("Ваша заявка на регистрацию уже отправлена администратору. Пожалуйста, ожидайте подтверждения.")
+        await update.message.reply_text("Ваша заявка на регистрацию уже отправлена администратору. Пожалуйста, ожидайте подтверждения.")
     else:
         await update.message.reply_text(
             "⚠️ *Внимание!*\n"
@@ -1701,42 +1779,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    if text == "❌ Отмена":
-        if context.user_data.get('cash_order'):
-            del context.user_data['cash_order']
-            await update.message.reply_text("Заказ кеша отменён.", reply_markup=get_main_keyboard(user_id))
-            return
-        if context.user_data.get('edit_class_mode'):
-            context.user_data.pop('edit_class_mode', None)
-            context.user_data.pop('edit_class_nick', None)
-            context.user_data.pop('edit_class_user_id', None)
-            await update.message.reply_text("Редактирование класса отменено.", reply_markup=get_main_keyboard(user_id))
-            return
-        if context.user_data.get('poll_creation'):
-            del context.user_data['poll_creation']
-            await update.message.reply_text("Создание опроса отменено.", reply_markup=get_polls_management_keyboard())
-            return
-        if context.user_data.get('activity_mode'):
-            context.user_data.pop('activity_mode', None)
-            context.user_data.pop('activity_step', None)
-            context.user_data.pop('activity_nicks', None)
-            await update.message.reply_text("Операция с активностью отменена.", reply_markup=get_main_keyboard(user_id))
-            return
-        if context.user_data.get('awaiting_nick') or context.user_data.get('awaiting_class'):
-            context.user_data.clear()
-            await update.message.reply_text("Регистрация отменена.", reply_markup=get_main_keyboard(user_id))
-            return
-        if context.user_data.get('reject_mode'):
-            context.user_data.pop('reject_mode', None)
-            await update.message.reply_text("Режим отмены заявок завершён.", reply_markup=get_main_keyboard(user_id))
-            return
-        if context.user_data.get('edit_nick_mode'):
-            context.user_data.pop('edit_nick_mode', None)
-            context.user_data.pop('edit_old_nick', None)
-            context.user_data.pop('edit_target_user_id', None)
-            await update.message.reply_text("Редактирование ника отменено.", reply_markup=get_main_keyboard(user_id))
-            return
-        # Если ничего не подошло – игнорируем
+    approve_admin_registration(user_id)
+    if await route_navigation(update, context):
+        return
+    if context.user_data.get('reject_mode'):
+        await handle_reject_pending(update, context)
+        return
+    if context.user_data.get('gvg_poll'):
+        await handle_gvg_poll_creation(update, context)
+        return
 
     # Ручной опрос админом
     if context.user_data.get('admin_poll_step') == 'awaiting_input':
@@ -1778,6 +1829,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_class = text
             add_pending_user(user_id, nick, user_class)
             context.user_data.pop('awaiting_class', None)
+            if is_admin(user_id):
+                approve_admin_registration(user_id)
+                await update.message.reply_text(
+                    f"✅ Администратор зарегистрирован: {nick} ({user_class}).",
+                    reply_markup=get_main_keyboard(user_id)
+                )
+                return
             await update.message.reply_text(
                 f"✅ Заявка на регистрацию отправлена!\nНик: {nick}\nКласс: {user_class}\n\n"
                 "Дождитесь подтверждения администратора.",
@@ -1794,26 +1852,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
-
-    # Администратор должен иметь возможность подтвердить первую регистрацию.
-    # Доступ к профилю и остальным игровым функциям требует регистрации.
-    if is_admin(user_id) and not is_user_valid(user_id):
-        if context.user_data.get('reject_mode'):
-            await handle_reject_pending(update, context)
-            return
-        if text in ("📊 Админ-панель", "🔙 Назад"):
-            await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
-            return
-        registration_actions = {
-            "📝 Регистрация": registration_menu,
-            "📋 Список ожидания": list_pending_command,
-            "✅ Подтвердить всех": confirm_all_pending_command,
-            "❌ Отказать": reject_pending_menu,
-        }
-        action = registration_actions.get(text)
-        if action:
-            await action(update, context)
-            return
 
     # Проверка валидности
     if not is_user_valid(user_id):
@@ -1865,12 +1903,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif text == "💰 Заказ кеша":
         await cash_order_start(update, context)
-    elif text == "📊 Админ-панель" and is_admin(user_id):
-        await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
-    elif text == "🔙 Назад" and is_admin(user_id):
-        await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
-    elif text == "📊 Управление опросами" and is_admin(user_id):
-        await update.message.reply_text("Управление опросами:", reply_markup=get_polls_management_keyboard())
     elif text == "📝 Создать опрос (ГВГ)" and is_admin(user_id):
         await start_gvg_poll_creation(update, context)
         return
@@ -1893,22 +1925,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for uid, nick in non_responders:
             msg += f"• {nick} (ID: `{uid}`)\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
-    elif text == "🏰 Управление кланом" and is_admin(user_id):
-        await update.message.reply_text("Управление кланом:", reply_markup=get_clan_management_keyboard())
     elif text == "💸 Выдача кеша" and is_admin(user_id):
         await process_cash_orders(update, context)
     elif text == "👥 Список пользователей" and is_admin(user_id):
         await users_command(update, context)
-    elif text == "✏️ Исправить профиль" and is_admin(user_id):
-        await edit_profile_menu(update, context)
     elif text == "✏️ Исправить класс" and is_admin(user_id):
         await edit_class_command(update, context)
     elif text == "🔄 Исправить ник" and is_admin(user_id):
         await edit_nick_command(update, context)
     elif text == "📊 Активность игроков" and is_admin(user_id):
         await activity_menu(update, context)
-    elif text == "📝 Регистрация" and is_admin(user_id):
-        await registration_menu(update, context)
     elif text == "📋 Список ожидания" and is_admin(user_id):
         await list_pending_command(update, context)
     elif text == "✅ Подтвердить всех" and is_admin(user_id):
@@ -2076,22 +2102,21 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_user_valid(user_id):
-        await update.message.reply_text("❌ Вы не зарегистрированы. Нажмите /start.")
-        return
-    await update.message.reply_text("Главное меню:", reply_markup=get_main_keyboard(user_id))
+    await start(update, context)
+
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+    clear_input_state(context)
+    await show_menu(update, context, context.user_data.get('menu', 'main'))
+
+
+async def end_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    if 'poll_creation' in context.user_data:
-        del context.user_data['poll_creation']
-        await update.message.reply_text("Создание опроса отменено.")
-    else:
-        await update.message.reply_text("Нет активного процесса создания опроса.")
+    deactivate_poll()
+    await update.message.reply_text("Опрос завершён.")
+
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('activity_mode') and not context.user_data.get('activity_step'):
@@ -2121,7 +2146,7 @@ def main():
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("send_poll", send_poll_to_all))
     app.add_handler(CommandHandler("export", export_command))
-    app.add_handler(CommandHandler("end_poll", lambda u,c: deactivate_poll() or u.message.reply_text("Опрос завершён.")))
+    app.add_handler(CommandHandler("end_poll", end_poll_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("edit_class", edit_class_command))
     app.add_handler(CallbackQueryHandler(show_all_ids_callback, pattern="^show_all_ids$"))
@@ -2133,8 +2158,6 @@ def main():
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(CallbackQueryHandler(gvg_callback, pattern="^(gvg_add_more|gvg_finish)"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_poll_creation), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_gvg_poll_creation), group=2)
     app.add_handler(CommandHandler("leave", leave_chat))
     app.add_handler(CommandHandler("remove_all_keyboards", remove_all_keyboards))
     app.add_handler(CommandHandler("calc_salary", calculate_salaries))
