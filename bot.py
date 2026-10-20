@@ -1634,7 +1634,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_class = get_user_class(user_id)
         await update.message.reply_text(f"С возвращением, {nick} (класс: {user_class})!", reply_markup=get_main_keyboard(user_id))
     elif is_pending(user_id):
-        await update.message.reply_text("Ваша заявка на регистрацию уже отправлена администратору. Пожалуйста, ожидайте подтверждения.")
+        if is_admin(user_id):
+            await update.message.reply_text(
+                "Ваша заявка ожидает подтверждения. Откройте «📝 Регистрация» "
+                "и проверьте список ожидания перед подтверждением заявок.",
+                reply_markup=get_admin_keyboard()
+            )
+        else:
+            await update.message.reply_text("Ваша заявка на регистрацию уже отправлена администратору. Пожалуйста, ожидайте подтверждения.")
     else:
         await update.message.reply_text(
             "⚠️ *Внимание!*\n"
@@ -1787,6 +1794,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Пожалуйста, выберите класс из предложенных кнопок.")
         return
+
+    # Администратор должен иметь возможность подтвердить первую регистрацию.
+    # Доступ к профилю и остальным игровым функциям требует регистрации.
+    if is_admin(user_id) and not is_user_valid(user_id):
+        if context.user_data.get('reject_mode'):
+            await handle_reject_pending(update, context)
+            return
+        if text in ("📊 Админ-панель", "🔙 Назад"):
+            await update.message.reply_text("Админ-панель:", reply_markup=get_admin_keyboard())
+            return
+        registration_actions = {
+            "📝 Регистрация": registration_menu,
+            "📋 Список ожидания": list_pending_command,
+            "✅ Подтвердить всех": confirm_all_pending_command,
+            "❌ Отказать": reject_pending_menu,
+        }
+        action = registration_actions.get(text)
+        if action:
+            await action(update, context)
+            return
 
     # Проверка валидности
     if not is_user_valid(user_id):
