@@ -7,6 +7,7 @@ import requests
 import base64
 import asyncio
 import sheet_layout as attendance
+import bot_ui as ui
 from contextlib import closing
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
@@ -181,8 +182,14 @@ def is_nick_taken(nick):
 
 
 def valid_nick(nick):
+    reserved = main_actions() | {
+        '🔙 Назад', '❌ Отмена', ui.HOME, '✅ Записать', 'ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ',
+        '📊 Админ-панель', '🏰 Управление кланом', '📊 Управление опросами',
+        '📝 Регистрация', '✏️ Исправить профиль',
+    }
     return (1 <= len(nick) <= 32 and not any(c in nick for c in '\n\r\t')
-            and nick not in main_actions() and attendance.label(nick) not in attendance.CLASS_ALIASES
+            and ui.canonical(nick) not in reserved
+            and attendance.label(nick) not in attendance.CLASS_ALIASES
             and attendance.label(nick) not in ('ИТОГО','ВСЕГО','ИТОГ','НИК'))
 
 
@@ -531,7 +538,8 @@ def number_text(value):
 def personal_report(nick, kind):
     report = attendance.player_stats(get_current_activity_sheet(),nick)
     values, events = report['values'], report['events']
-    lines = [f"{report['sheet']} — {report['nick']}"]
+    title = '💰 Моя зарплата' if kind == 'salary' else '📊 Мои посещения'
+    lines = [title, f"{report['sheet']} — {report['nick']}"]
     if kind == 'salary':
         lines += [f"ЗП 1/2: {number_text(values.get('ЗП 1/2'))}",
                   f"ЗП 2/2: {number_text(values.get('ЗП 2/2'))}",
@@ -585,7 +593,7 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     try:
         title, result = await asyncio.to_thread(salary_summary)
-        await update.message.reply_text(f"💰 {title}. Зарплата по формулам таблицы:")
+        await update.message.reply_text(f'Администратор → Зарплаты игроков\n{title}. Суммы из таблицы:')
         # Keep messages within Telegram's limit without changing the formulas.
         chunk = ''
         for line in result:
@@ -644,7 +652,7 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         count = await asyncio.to_thread(sync_pa_internal)
-        await update.message.reply_text(f"✅ Добавлено игроков в текущий месяц: {count}.")
+        await update.message.reply_text(f'✅ Состав в таблице обновлён. Добавлено новых игроков: {count}.')
     except Exception as exc:
         await update.message.reply_text(f"❌ Синхронизация не выполнена: {exc}")
 
@@ -774,9 +782,9 @@ async def cash_order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     begin_form(context, 'main')
     context.user_data['cash_order'] = {'step': 'photo'}
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    keyboard = form_keyboard(cancel='❌ Отменить заявку')
     await update.message.reply_text(
-        "📸 Отправьте скриншот из личного кабинета с донатом.\n\nПосле этого кешбек будет выдан золотыми яйцами.",
+        'Кешбек → Скриншот доната\nОтправьте скриншот из личного кабинета. Администратор проверит заявку и выдаст кешбек золотыми яйцами.',
         reply_markup=keyboard
     )
 
@@ -827,23 +835,24 @@ async def process_cash_orders(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['menu'] = 'admin'
     order = get_next_pending_order()
     if not order:
-        await message.reply_text("Нет новых заявок на кеш.")
+        await message.reply_text('Кешбек → Очередь заявок\nНет новых заявок на кешбек.', reply_markup=get_admin_keyboard())
         return
     order_id, uid, nick, photo_file_id, description = order
     try:
         await context.bot.send_photo(
             chat_id=user_id,
             photo=photo_file_id,
-            caption=f"👤 Ник: {nick}\n🎭 Класс: {get_user_class(uid)}\n📦 Заявка на кеш (кешбек золотыми яйцами)"
+            caption=f'Кешбек → Заявка №{order_id}\nИгрок: {nick} ({get_user_class(uid)})\nПроверьте скриншот перед выдачей кешбека.'
         )
     except Exception as e:
         await message.reply_text(f"Не удалось отправить фото. Ошибка: {e}")
         await message.reply_text(f"👤 Ник: {nick}\n🎭 Класс: {get_user_class(uid)}")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Отправлено", callback_data=f"cash_done_{order_id}")],
-        [InlineKeyboardButton("❌ Отклонено", callback_data=f"cash_reject_{order_id}")]
+        [InlineKeyboardButton('✅ Кешбек выдан', callback_data=f'cash_done_{order_id}')],
+        [InlineKeyboardButton('❌ Отклонить заявку', callback_data=f'cash_reject_{order_id}')]
     ])
-    await message.reply_text("Действие по заявке:", reply_markup=keyboard)
+    await message.reply_text('Подтвердите выдачу или отклоните эту заявку:', reply_markup=keyboard)
+    await message.reply_text('Для выхода используйте панель администратора.', reply_markup=get_admin_keyboard())
 
 async def cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query=update.callback_query
@@ -878,10 +887,10 @@ async def edit_class_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    begin_form(context, 'profile')
+    begin_form(context, 'clan')
     context.user_data['edit_class_mode'] = True
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text("Введите ник пользователя, чей класс нужно изменить:", reply_markup=keyboard)
+    await update.message.reply_text('Состав клана → Изменить класс\nШаг 1 из 2: введите ник игрока.',
+                                    reply_markup=form_keyboard(cancel='❌ Отменить редактирование'))
 
 async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('edit_class_mode'):
@@ -890,33 +899,27 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         return
     text = update.message.text.strip()
-    if text == "❌ Отмена":
-        context.user_data.pop('edit_class_mode', None)
-        context.user_data.pop('edit_class_nick', None)
-        context.user_data.pop('edit_class_user_id', None)
-        await update.message.reply_text("Редактирование отменено.", reply_markup=get_admin_keyboard())
-        return
     if 'edit_class_nick' not in context.user_data:
         target_nick = text
         target_user_id = get_user_id_by_nick(target_nick)
         if not target_user_id:
-            await update.message.reply_text(f"Пользователь с ником {target_nick} не найден. Попробуйте ещё раз или нажмите «❌ Отмена».")
+            await update.message.reply_text(f'Игрок {target_nick} не найден. Введите ник ещё раз или нажмите «❌ Отменить редактирование».')
             return
         context.user_data['edit_class_nick'] = target_nick
         context.user_data['edit_class_user_id'] = target_user_id
         classes = CHARACTER_CLASSES
-        keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
-        keyboard.append([KeyboardButton("❌ Отмена")])
+        keyboard = form_keyboard([list(classes[i:i+3]) for i in range(0, len(classes), 3)],
+                                 cancel='❌ Отменить редактирование')
         await update.message.reply_text(
-            f"Найден пользователь: {target_nick}. Текущий класс: {get_user_class(target_user_id)}.\n"
-            "Выберите новый класс:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            f'Состав клана → {target_nick} → Изменить класс\nШаг 2 из 2: выберите новый класс.\n'
+            f'Сейчас: {get_user_class(target_user_id)}. После выбора профиль будет сохранён.',
+            reply_markup=keyboard
         )
         return
     new_class = text.upper()
     valid_classes = CHARACTER_CLASSES
     if new_class not in valid_classes:
-        await update.message.reply_text("Неверный класс. Выберите из кнопок или нажмите «❌ Отмена».")
+        await update.message.reply_text('Неверный класс. Выберите класс кнопкой или нажмите «❌ Отменить редактирование».')
         return
     target_user_id = context.user_data['edit_class_user_id']
     try:
@@ -931,17 +934,17 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
     clear_input_state(context)
-    await show_menu(update,context,'profile')
+    await show_menu(update,context,'clan')
 
 async def edit_nick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    begin_form(context, 'profile')
+    begin_form(context, 'clan')
     context.user_data['edit_nick_mode'] = True
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text("Введите старый ник пользователя, чей ник нужно изменить:", reply_markup=keyboard)
+    await update.message.reply_text('Состав клана → Изменить ник\nШаг 1 из 2: введите текущий ник игрока.',
+                                    reply_markup=form_keyboard(cancel='❌ Отменить редактирование'))
 
 async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get('edit_nick_mode'):
@@ -950,21 +953,16 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         return
     text = update.message.text.strip()
-    if text == "❌ Отмена":
-        context.user_data.pop('edit_nick_mode', None)
-        context.user_data.pop('edit_old_nick', None)
-        context.user_data.pop('edit_target_user_id', None)
-        await update.message.reply_text("Редактирование отменено.", reply_markup=get_admin_keyboard())
-        return
     if 'edit_old_nick' not in context.user_data:
         old_nick = text
         target_user_id = get_user_id_by_nick(old_nick)
         if not target_user_id:
-            await update.message.reply_text(f"Пользователь с ником {old_nick} не найден. Попробуйте ещё раз или нажмите «❌ Отмена».")
+            await update.message.reply_text(f'Игрок {old_nick} не найден. Введите ник ещё раз или нажмите «❌ Отменить редактирование».')
             return
         context.user_data['edit_old_nick'] = old_nick
         context.user_data['edit_target_user_id'] = target_user_id
-        await update.message.reply_text("Введите новый ник для этого пользователя:")
+        await update.message.reply_text(f'Состав клана → {old_nick} → Изменить ник\n'
+                                        'Шаг 2 из 2: введите новый ник. После ввода профиль будет сохранён.')
         return
     new_nick = text
     if not valid_nick(new_nick):
@@ -991,23 +989,61 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('edit_old_nick', None)
     context.user_data.pop('edit_target_user_id', None)
     clear_input_state(context)
-    await show_menu(update,context,'profile')
+    await show_menu(update,context,'clan')
 
 # ---------- АКТИВНОСТЬ ИГРОКОВ ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text('Доступно только администратору.')
         return
-    begin_form(context, 'clan')
+    begin_form(context, 'admin')
     context.user_data.update(activity_mode=True, activity_step='select_activity')
-    await update.message.reply_text('Выберите мероприятие, затем дату и загрузите скриншоты.',
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(e)] for e in attendance.EVENTS]
-            + [[KeyboardButton('❌ Отмена')]], resize_keyboard=True))
+    await show_activity_step(update, context)
 
 
 def upload_keyboard():
-    return ReplyKeyboardMarkup([[KeyboardButton('ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ')],
-                               [KeyboardButton('❌ Отмена')]], resize_keyboard=True)
+    return form_keyboard([[ui.FINISH_UPLOAD]], cancel='❌ Отменить загрузку')
+
+
+def activity_heading(state, number, title):
+    path = 'Посещение'
+    if state.get('activity_event') and number > 1:
+        path += ' → ' + state['activity_event']
+    if state.get('activity_date') and number > 2:
+        path += ' → ' + state['activity_date']
+    return f'{path}\nШаг {number} из 4: {title}\n\n'
+
+
+async def show_activity_step(update, context):
+    state = context.user_data
+    step = state['activity_step']
+    if step == 'select_activity':
+        text = activity_heading(state, 1, 'мероприятие') + 'Выберите мероприятие.'
+        keyboard = form_keyboard([[e] for e in attendance.EVENTS], cancel='❌ Отменить загрузку')
+    elif step == 'select_date':
+        dates = sorted(state['activity_dates'], key=lambda value: datetime.strptime(value, '%d.%m.%Y'))
+        text = activity_heading(state, 2, 'дата') + 'Выберите дату мероприятия из таблицы.'
+        keyboard = form_keyboard([[d] for d in dates], cancel='❌ Отменить загрузку')
+    elif step == 'upload':
+        text = (activity_heading(state, 3, 'скриншоты')
+                + f"Принято скриншотов: {state.get('activity_screenshots', 0)}. "
+                + f"Определено игроков: {len(state.get('activity_nicks', []))}.\n"
+                + 'Отправляйте скриншоты по одному или альбомом. Верхний игрок каждого скриншота — ПЛ.\n'
+                + f'Когда отправите все, нажмите «{ui.FINISH_UPLOAD}».')
+        keyboard = upload_keyboard()
+    else:
+        text = (activity_heading(state, 4, 'проверка перед сохранением')
+                + f"Скриншотов: {state['activity_screenshots']}. Игроков: {len(state['activity_nicks'])}.\n"
+                + 'ПЛ (2): ' + (', '.join(state['activity_leaders']) or 'не определены')
+                + '\nВсе игроки: ' + ', '.join(state['activity_nicks'])
+                + ('\n⚠️ Не определены: ' + ', '.join(state['activity_unknown'])
+                   + '. Заполните их вручную в таблице.' if state['activity_unknown'] else '')
+                + '\n\nПроверьте мероприятие, дату и игроков. До нажатия «Сохранить посещение» отметки не записаны.'
+                + '\nЧтобы добавить скриншоты, нажмите «← Назад».')
+        keyboard = form_keyboard([[ui.SAVE_ATTENDANCE]], cancel='❌ Отменить загрузку')
+    if state.get('activity_screenshots') and step in ('select_activity', 'select_date'):
+        text += '\nЗагруженные скриншоты сохранены в этой операции. Проверьте дату и мероприятие перед записью.'
+    await send_activity_report(update, text, reply_markup=keyboard)
 
 
 async def send_activity_report(update, text, reply_markup=None):
@@ -1054,7 +1090,9 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(update.effective_user.id) or not state.get('activity_mode'):
         return
     if state.get('activity_step') != 'upload':
-        await update.message.reply_text('Сначала выберите мероприятие и дату. Для новой загрузки откройте «Активность игроков».')
+        hint = ('Чтобы добавить скриншоты, нажмите «← Назад».' if state.get('activity_step') == 'confirm'
+                else 'Сначала выберите мероприятие и дату.')
+        await update.message.reply_text('Скриншоты принимаются на шаге 3. ' + hint)
         return
     try:
         photo_file = await update.message.photo[-1].get_file()
@@ -1069,13 +1107,14 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
         recognized, unknown, leader = accumulate_screenshot(state, raw, state['activity_known'])
         state['activity_screenshots'] += 1
         await send_activity_report(update,
-            f"Скриншот №{state['activity_screenshots']}. Определены: " + (', '.join(recognized) or 'нет')
+            activity_heading(state, 3, 'скриншоты')
+            + f"Скриншот №{state['activity_screenshots']}. Определены: " + (', '.join(recognized) or 'нет')
             + ('\nПЛ: ' + leader if leader else '\n⚠️ Верхний ник «' + raw[0]
                + '» не определён. ПЛ не назначен; отметьте его вручную в таблице значением 2.')
             + ('\n⚠️ Не определены: ' + ', '.join(unknown)
                + '. Проверьте эти ники на скриншоте и отметьте их вручную в таблице.' if unknown else '')
-            + f"\nВсего уникальных игроков: {len(state['activity_nicks'])}."
-            + '\nЗагрузите следующий скриншот или завершите загрузку.',
+            + f"\nПринято скриншотов: {state['activity_screenshots']}. Определено игроков: {len(state['activity_nicks'])}."
+            + f'\nОтправьте следующий скриншот или нажмите «{ui.FINISH_UPLOAD}».',
             reply_markup=upload_keyboard())
     except Exception as exc:
         await update.message.reply_text(f'❌ Скриншот не обработан: {exc}. Можно повторить отправку или отметить игроков вручную.')
@@ -1085,7 +1124,7 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(update.effective_user.id):
         return
     state = context.user_data
-    text = update.message.text.strip()
+    text = ui.canonical(update.message.text.strip())
     try:
         year, month = attendance.moscow_month()
         step = state.get('activity_step')
@@ -1094,14 +1133,14 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text('Выберите событие из кнопок.')
                 return
             ws = await asyncio.to_thread(get_current_activity_sheet)
-            state['activity_sheet'] = ws.title
+            if state.get('activity_screenshots') and ws.title != state.get('activity_sheet'):
+                raise ValueError('Месяц сменился. Начните загрузку заново.')
             rows = await asyncio.to_thread(ws.get_all_values)
             dates = attendance.event_dates(rows, text, year, month)
             if not dates:
                 raise ValueError('В заголовках события нет дат. Заполните даты в месячном листе.')
-            state.update(activity_event=text, activity_dates=dates, activity_step='select_date')
-            await update.message.reply_text('Выберите дату события:', reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton(d)] for d in dates] + [[KeyboardButton('❌ Отмена')]], resize_keyboard=True))
+            state.update(activity_event=text, activity_dates=dates, activity_step='select_date', activity_sheet=ws.title)
+            await show_activity_step(update, context)
         elif step == 'select_date':
             if text not in state['activity_dates']:
                 await update.message.reply_text('Выберите дату из кнопок.')
@@ -1110,30 +1149,21 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             if ws.title != state['activity_sheet']:
                 raise ValueError('Месяц сменился. Начните загрузку заново.')
             rows = await asyncio.to_thread(ws.get_all_values)
-            state.update(activity_date=text, activity_step='upload', activity_nicks=[],
-                         activity_leaders=[], activity_unknown=[], activity_screenshots=0,
+            state.update(activity_date=text, activity_step='upload',
                          activity_known=[nick for _, nick in attendance.players(rows)])
-            await update.message.reply_text(
-                f"{state['activity_event']} — {text}.\nЗагружайте скриншоты. Верхний игрок каждого скриншота — ПЛ."
-                + '\nКогда все скриншоты отправлены, нажмите «ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ».',
-                reply_markup=upload_keyboard())
+            for key in ('activity_nicks', 'activity_leaders', 'activity_unknown'):
+                state.setdefault(key, [])
+            state.setdefault('activity_screenshots', 0)
+            await show_activity_step(update, context)
         elif step == 'upload':
             if text != 'ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ':
-                await update.message.reply_text('Отправьте скриншот либо нажмите «ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ».')
+                await update.message.reply_text(f'Отправьте скриншот либо нажмите «{ui.FINISH_UPLOAD}».', reply_markup=upload_keyboard())
                 return
             if not state['activity_screenshots'] or not state['activity_nicks']:
                 await update.message.reply_text('Пока нет определённых игроков. Загрузите скриншот или отмените операцию.')
                 return
             state['activity_step'] = 'confirm'
-            await send_activity_report(update,
-                f"{state['activity_event']} — {state['activity_date']}\n"
-                + f"Скриншотов: {state['activity_screenshots']}. Игроков: {len(state['activity_nicks'])}.\n"
-                + 'ПЛ (2): ' + (', '.join(state['activity_leaders']) or 'не определены')
-                + '\nВсе игроки: ' + ', '.join(state['activity_nicks'])
-                + ('\n⚠️ Не определены: ' + ', '.join(state['activity_unknown'])
-                   + '. Заполните их вручную в таблице.' if state['activity_unknown'] else ''),
-                reply_markup=ReplyKeyboardMarkup([[KeyboardButton('✅ Записать')],
-                                                  [KeyboardButton('❌ Отмена')]], resize_keyboard=True))
+            await show_activity_step(update, context)
         elif step == 'confirm':
             if text != '✅ Записать':
                 await update.message.reply_text('Подтвердите запись кнопкой или отмените.')
@@ -1148,12 +1178,15 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
                 raise ValueError('Дата удалена из таблицы. Начните заново.')
             count, missing = await asyncio.to_thread(attendance.mark_attendance, ws, col,
                 state['activity_nicks'], state['activity_leaders'])
+            event, date = state['activity_event'], state['activity_date']
             clear_input_state(context)
-            context.user_data['menu']='main'
-            await update.message.reply_text(f"✅ Обновлено отметок: {count}."
-                + (" Не найдены: " + ', '.join(missing) + '. Отметьте их вручную в таблице.' if missing else ''), reply_markup=get_main_keyboard(update.effective_user.id))
+            context.user_data['menu']='admin'
+            await update.message.reply_text(f'✅ Посещение сохранено: {event} → {date}.\nОбновлено отметок: {count}.'
+                + (" Не найдены: " + ', '.join(missing) + '. Отметьте их вручную в таблице.' if missing else ''),
+                reply_markup=make_keyboard([['📸 Отметить другое мероприятие'], ['📊 Админ-панель', ui.HOME]]))
     except Exception as exc:
-        await update.message.reply_text(f"❌ Запись не выполнена: {exc}\nМожно отменить операцию и начать заново.")
+        action = 'Запись не выполнена' if state.get('activity_step') == 'confirm' else 'Не удалось продолжить загрузку'
+        await update.message.reply_text(f'❌ {action}: {exc}\nМожно повторить действие, вернуться назад или отменить загрузку.')
 
 
 # ---------- УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ (АДМИН) ----------
@@ -1162,13 +1195,10 @@ async def registration_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    keyboard = [
-        [KeyboardButton("📋 Список ожидания")],
-        [KeyboardButton("✅ Подтвердить всех")],
-        [KeyboardButton("❌ Отказать")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    await update.message.reply_text("Управление регистрацией:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    context.user_data['menu'] = 'registration'
+    keyboard = make_keyboard([['📋 Список ожидания'], ['✅ Подтвердить всех'], ['❌ Отказать'], [ui.BACK, ui.HOME]])
+    await update.message.reply_text(f'Администратор → Заявки игроков\nОжидают подтверждения: {len(get_pending_users())}.\n'
+                                    'Посмотрите список перед подтверждением заявок.', reply_markup=keyboard)
 
 def get_reject_keyboard():
     pending = get_pending_users()
@@ -1183,7 +1213,8 @@ def get_reject_keyboard():
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([KeyboardButton("🔙 Назад")])
+    keyboard.append([KeyboardButton(ui.BACK), KeyboardButton('❌ Отменить действие')])
+    keyboard.append([KeyboardButton(ui.HOME)])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def reject_pending_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1194,9 +1225,10 @@ async def reject_pending_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = get_reject_keyboard()
     if not keyboard:
         context.user_data.pop('reject_mode',None)
-        await update.message.reply_text("Нет ожидающих регистрации.")
+        await update.message.reply_text('Нет ожидающих регистрации.')
+        await show_menu(update, context, 'registration')
         return
-    await update.message.reply_text("Выберите пользователя для отмены заявки:", reply_markup=keyboard)
+    await update.message.reply_text('Заявки игроков → Отклонить заявку\nВыберите игрока. После нажатия его заявка будет отклонена.', reply_markup=keyboard)
     begin_form(context, 'registration')
     context.user_data['reject_mode'] = True
 
@@ -1207,10 +1239,6 @@ async def handle_reject_pending(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(user_id):
         return
     text = update.message.text
-    if text == "🔙 Назад":
-        context.user_data.pop('reject_mode', None)
-        await registration_menu(update, context)
-        return
     if text.startswith("❌ "):
         pending=get_pending_users()
         selected=next(((uid,nick) for uid,nick,*_ in pending if text==f'❌ [{uid}] {nick}' or text==f'❌ {nick}'),None)
@@ -1318,14 +1346,14 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
     begin_form(context, 'polls')
     context.user_data['admin_poll_step'] = 'awaiting_input'
     context.user_data['admin_poll_data'] = {'poll_id': poll['id'], 'meetings': poll['meetings']}
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+    keyboard = form_keyboard(cancel='❌ Отменить опрос')
     await update.message.reply_text(
-        "Введите данные для прохождения опроса за другого игрока в формате:\n\n"
-        "`НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 \\ ОТВЕТ_3 ...`\n\n"
+        'Опросы ГВГ → Ответить за игрока\nВведите данные в формате:\n\n'
+        "НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 \\ ОТВЕТ_3 ...\n\n"
         f"Количество ответов должно быть равно количеству встреч в опросе ({len(poll['meetings'])}):\n"
         f"{', '.join(poll['meetings'])}\n\n"
-        "Пример: `Qudas \\ ВАР \\ Буду \\ Не буду \\ Не знаю`\n\n"
-        "Для отмены нажмите «❌ Отмена».",
+        "Пример: Qudas \\ ВАР \\ Буду \\ Не буду \\ Не знаю\n\n"
+        'После отправки данные будут сохранены. Можно последовательно ввести нескольких игроков.',
 
         reply_markup=keyboard
     )
@@ -1335,11 +1363,6 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(user_id) or context.user_data.get('admin_poll_step') != 'awaiting_input':
         return
     text = update.message.text.strip()
-    if text == "❌ Отмена":
-        context.user_data.pop('admin_poll_step', None)
-        context.user_data.pop('admin_poll_data', None)
-        await update.message.reply_text("Операция отменена.", reply_markup=get_main_keyboard(user_id))
-        return
     parts = [part.strip() for part in text.split('\\')]
     if len(parts) < 3:
         await update.message.reply_text("❌ Неверный формат. Ожидается: НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 ...")
@@ -1383,7 +1406,7 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(
         f"✅ Ответы для {nick} (класс: {user_class}) сохранены!\n"
         f"Встречи и ответы:\n" + "\n".join([f"• {m}: {a}" for m, a in zip(meetings, answers)]),
-        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        reply_markup=form_keyboard(cancel='❌ Отменить опрос')
     )
 
 # ---------- НОВЫЙ СЦЕНАРИЙ СОЗДАНИЯ ГВГ-ОПРОСА ----------
@@ -1393,15 +1416,33 @@ async def start_gvg_poll_creation(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Доступно только администратору.")
         return
     begin_form(context, 'polls')
-    context.user_data['gvg_poll'] = {'step': 'datetime'}
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text(
-        "Введите дату и время ГВГ в формате:\n"
-        "`ДД.ММ.ГГГГ ЧЧ:ММ` (например, 25.06.2026 19:00)\n\n"
-        "Для отмены нажмите «❌ Отмена».",
+    context.user_data['gvg_poll'] = {'step': 'datetime', 'replaces_poll': bool(get_active_poll())}
+    await show_gvg_step(update.message, context.user_data['gvg_poll'])
 
-        reply_markup=keyboard
-    )
+
+async def show_gvg_step(message, data):
+    number = len(data.get('gvg_list', [])) + 1
+    heading = f'Опросы ГВГ → Создать опрос → Встреча {number}\n'
+    if data['step'] == 'datetime':
+        text = heading + 'Шаг 1 из 3: дата и время\nВведите ДД.ММ.ГГГГ ЧЧ:ММ, например 25.10.2026 19:00.'
+        if data.get('datetime'):
+            text += '\nРанее: ' + data['datetime']
+        markup = form_keyboard(cancel='❌ Отменить опрос')
+    elif data['step'] == 'opponents':
+        text = (heading + f"Шаг 2 из 3: противник\nДата: {data['datetime']}.\n"
+                + 'Введите название клана противника или «-», если он пока неизвестен.')
+        markup = form_keyboard(cancel='❌ Отменить опрос')
+    else:
+        text = (heading + f"Шаг 3 из 3: проверка встречи\n{data['datetime']} — {data['opponents']}\n\n"
+                + 'Добавьте следующую встречу или создайте опрос. Для исправления нажмите «← Назад».')
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton('➕ Добавить ещё ГВГ', callback_data='gvg_add_more')],
+            [InlineKeyboardButton('✅ Создать опрос', callback_data='gvg_finish')]])
+    if data.get('replaces_poll'):
+        text += '\nПосле создания нового опроса предыдущий активный опрос будет закрыт.'
+    sent = await message.reply_text(text, reply_markup=markup)
+    if data['step'] == 'waiting_choice' and isinstance(getattr(sent, 'message_id', None), int):
+        data['choice_message_id'] = sent.message_id
 
 async def handle_gvg_poll_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'gvg_poll' not in context.user_data:
@@ -1411,19 +1452,15 @@ async def handle_gvg_poll_creation(update: Update, context: ContextTypes.DEFAULT
         return
     text = update.message.text.strip()
     data = context.user_data['gvg_poll']
-    if text == "❌ Отмена":
-        context.user_data.pop('gvg_poll', None)
-        await update.message.reply_text("Создание ГВГ-опроса отменено.", reply_markup=get_admin_keyboard())
-        return
     if data['step'] == 'datetime':
         try:
             parsed = datetime.strptime(text, "%d.%m.%Y %H:%M")
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат. Используйте `ДД.ММ.ГГГГ ЧЧ:ММ`")
+            await update.message.reply_text('❌ Неверный формат. Введите ДД.ММ.ГГГГ ЧЧ:ММ, например 25.10.2026 19:00.')
             return
         data['datetime'] = parsed.strftime('%d.%m.%Y %H:%M')
         data['step'] = 'opponents'
-        await update.message.reply_text("Введите название противников (или «-», если нет):")
+        await show_gvg_step(update.message, data)
         return
     elif data['step'] == 'opponents':
         if not text or len(text)>80:
@@ -1433,18 +1470,10 @@ async def handle_gvg_poll_creation(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text('Такая встреча уже добавлена. Укажите другого противника или отмените создание опроса.')
             return
         data['opponents'] = text
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Продолжить (добавить ещё ГВГ)", callback_data="gvg_add_more")],
-            [InlineKeyboardButton("✅ Закончить и создать опрос", callback_data="gvg_finish")]
-        ])
-        await update.message.reply_text(
-            f"ГВГ добавлен:\n📅 {data['datetime']}\n⚔️ Противники: {data['opponents']}\n\n"
-            "Выберите действие:",
-            reply_markup=keyboard
-        )
         data['step'] = 'waiting_choice'
+        await show_gvg_step(update.message, data)
     elif data['step'] == 'waiting_choice':
-        await update.message.reply_text('Выберите действие кнопками под последней добавленной встречей или нажмите «❌ Отмена».')
+        await show_gvg_step(update.message, data)
 
 async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1454,6 +1483,9 @@ async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Сессия создания опроса не найдена.")
         return
     data = context.user_data['gvg_poll']
+    if data.get('choice_message_id') and data['choice_message_id'] != getattr(query.message, 'message_id', None):
+        await query.message.reply_text('Эта кнопка устарела. Используйте последнее сообщение создания опроса.')
+        return
     if data.get('step') != 'waiting_choice':
         await query.message.reply_text("Сначала введите дату и противников текущего ГВГ.")
         return
@@ -1468,15 +1500,10 @@ async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'opponents': data['opponents']
         })
         data['step'] = 'datetime'
-        keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        data.pop('datetime', None)
+        data.pop('opponents', None)
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(
-            "Введите дату и время следующего ГВГ в формате:\n"
-            "`ДД.ММ.ГГГГ ЧЧ:ММ`\n\n"
-            "Для отмены создания опроса нажмите «❌ Отмена».",
-
-            reply_markup=keyboard
-        )
+        await show_gvg_step(query.message, data)
     elif query.data == "gvg_finish":
         entries=list(data.get('gvg_list',[]))
         if 'datetime' in data and 'opponents' in data:
@@ -1496,23 +1523,24 @@ async def gvg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data.pop('gvg_poll', None)
         context.user_data['menu']='polls'
-        await query.message.reply_text("Управление опросами:", reply_markup=get_polls_management_keyboard())
+        await query.message.reply_text('Опрос создан. Нажмите «📨 Отправить опрос игрокам», чтобы начать рассылку.',
+                                        reply_markup=get_polls_management_keyboard())
 
 # ---------- КЛАВИАТУРЫ ----------
 def get_main_keyboard(user_id):
     if not is_registered(user_id):
-        rows = [[KeyboardButton('/start')]]
+        rows = [['/start']]
         if is_admin(user_id):
-            rows.append([KeyboardButton('📊 Админ-панель')])
-        return ReplyKeyboardMarkup(rows,resize_keyboard=True)
+            rows.append(['📊 Админ-панель'])
+        return make_keyboard(rows)
     keyboard = [
-        [KeyboardButton("👤 Мой профиль"), KeyboardButton("💰 Моя ЗП")],
-        [KeyboardButton("📊 Моя активность"), KeyboardButton("📝 Мои ответы")],
-        [KeyboardButton("❓ Помощь"), KeyboardButton("💰 Заказ кеша")]
+        ['👤 Мой профиль', '💰 Моя ЗП'],
+        ['📊 Моя активность', '📝 Мои ответы'],
+        ['💰 Заказ кеша', '❓ Помощь'],
     ]
     if is_admin(user_id):
-        keyboard.append([KeyboardButton("📊 Админ-панель")])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        keyboard.append(['📊 Админ-панель'])
+    return make_keyboard(keyboard)
 
 async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_valid(update.effective_user.id):
@@ -1526,48 +1554,51 @@ async def my_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_admin_keyboard():
-    keyboard = [
-        [KeyboardButton("📝 Регистрация")],
-        [KeyboardButton("📊 Управление опросами")],
-        [KeyboardButton("🏰 Управление кланом")],
-        [KeyboardButton("💸 Выдача кеша"), KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return make_keyboard([
+        ['📊 Активность игроков'],
+        ['📝 Регистрация', '🏰 Управление кланом'],
+        ['📊 Управление опросами', '💰 Зарплаты игроков'],
+        ['💸 Выдача кеша', '📄 Открыть таблицу'],
+        [ui.HOME],
+    ])
 
 def get_polls_management_keyboard():
-    keyboard = [
-        [KeyboardButton("📝 Создать опрос (ГВГ)"), KeyboardButton("👥 Пройти за другого")],
-        [KeyboardButton("📤 Разослать опрос"), KeyboardButton("📈 Результаты опроса")],
-        [KeyboardButton("❌ Не ответившие"), KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return make_keyboard([
+        ['📝 Создать опрос (ГВГ)', '📤 Разослать опрос'],
+        ['👥 Пройти за другого', '❌ Не ответившие'],
+        ['📈 Результаты опроса'],
+        [ui.BACK, ui.HOME],
+    ])
 
 def get_clan_management_keyboard():
-    keyboard = [
-        [KeyboardButton("👥 Список пользователей")],
-        [KeyboardButton("✏️ Исправить профиль"), KeyboardButton("📊 Активность игроков")],
-        [KeyboardButton("💰 Зарплаты игроков"), KeyboardButton("📝 Регистрация")],
-        [KeyboardButton("🔄 Синхронизировать игроков")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return make_keyboard([
+        ['👥 Список пользователей'],
+        ['🔄 Исправить ник', '✏️ Исправить класс'],
+        ['🔄 Синхронизировать игроков'],
+        [ui.BACK, ui.HOME],
+    ])
+
+
+def make_keyboard(rows):
+    return ReplyKeyboardMarkup([[KeyboardButton(ui.display(text)) for text in row] for row in rows],
+                               resize_keyboard=True)
+
+
+def form_keyboard(rows=None, cancel='❌ Отменить действие'):
+    return make_keyboard(list(rows or []) + [[ui.BACK, cancel], [ui.HOME]])
 
 async def edit_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    keyboard = [
-        [KeyboardButton("✏️ Исправить класс")],
-        [KeyboardButton("🔄 Исправить ник")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    await update.message.reply_text("Выберите, что хотите исправить:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    await update.message.reply_text('Состав клана → Изменить профиль\nВыберите действие:',
+        reply_markup=make_keyboard([['✏️ Исправить класс'], ['🔄 Исправить ник'], [ui.BACK, ui.HOME]]))
 
 def get_class_keyboard():
     classes = CHARACTER_CLASSES
-    keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    return form_keyboard([[cls for cls in classes[i:i+3]] for i in range(0, len(classes), 3)],
+                         cancel='❌ Отменить регистрацию')
 
 MENU_PARENTS = {
     "admin": "main", "polls": "admin", "clan": "admin",
@@ -1594,7 +1625,8 @@ def main_actions():
             '💰 Заказ кеша','📝 Создать опрос (ГВГ)','👥 Пройти за другого','📤 Разослать опрос',
             '📈 Результаты опроса','❌ Не ответившие','💸 Выдача кеша','👥 Список пользователей',
             '✏️ Исправить класс','🔄 Исправить ник','📊 Активность игроков','📋 Список ожидания',
-            '✅ Подтвердить всех','❌ Отказать','💰 Расчет ЗП','💰 Зарплаты игроков','🔄 Синхронизировать игроков'}
+            '✅ Подтвердить всех','❌ Отказать','💰 Расчет ЗП','💰 Зарплаты игроков','🔄 Синхронизировать игроков',
+            '📄 Открыть таблицу'}
 
 
 async def show_menu(update, context, menu='main'):
@@ -1609,28 +1641,37 @@ async def show_menu(update, context, menu='main'):
         await edit_profile_menu(update, context)
     else:
         menus = {
-            'main': ("Главное меню:", lambda: get_main_keyboard(user_id)),
-            'admin': ("Админ-панель:", get_admin_keyboard),
-            'polls': ("Управление опросами:", get_polls_management_keyboard),
-            'clan': ("Управление кланом:", get_clan_management_keyboard),
+            'main': ('🏠 Главное меню\nВыберите, что хотите посмотреть или сделать.', lambda: get_main_keyboard(user_id)),
+            'admin': ('⚙️ Панель администратора\nПосещение можно отметить сразу кнопкой ниже.', get_admin_keyboard),
+            'polls': ('Администратор → Опросы ГВГ\nСоздайте опрос, отправьте игрокам или выгрузите ответы в таблицу.', get_polls_management_keyboard),
+            'clan': ('Администратор → Состав клана\nПосмотрите список игроков, измените профиль или обновите состав в таблице.', get_clan_management_keyboard),
         }
         title, keyboard = menus[menu]
         await update.message.reply_text(title, reply_markup=keyboard())
 
 
 async def route_navigation(update, context):
-    text = update.message.text
+    text = ui.canonical(update.message.text.strip())
     destinations = {
         "📊 Админ-панель": 'admin', "📊 Управление опросами": 'polls',
         "🏰 Управление кланом": 'clan', "📝 Регистрация": 'registration',
         "✏️ Исправить профиль": 'profile',
     }
-    if text in ("🔙 Назад", "❌ Отмена"):
+    if text == ui.HOME:
+        clear_input_state(context)
+        context.user_data.pop('poll_session', None)
+        await show_menu(update, context, 'main')
+        return True
+    if text == '🔙 Назад' and await back_in_form(update, context):
+        return True
+    if text in ('🔙 Назад', '❌ Отмена'):
         current = context.user_data.get('menu', 'main')
         # Back/cancel from a form returns to its menu, not its parent.
         in_form = any(k not in ('menu','poll_session') for k in context.user_data)
-        destination = current if in_form else MENU_PARENTS.get(current, 'main')
+        destination = current if in_form or text == '❌ Отмена' else MENU_PARENTS.get(current, 'main')
         clear_input_state(context)
+        if in_form and text == '❌ Отмена':
+            await update.message.reply_text('Операция отменена. Несохранённые данные этой операции не записаны.')
         await show_menu(update, context, destination)
         return True
     if text in destinations:
@@ -1641,6 +1682,81 @@ async def route_navigation(update, context):
         await show_menu(update, context, destinations[text])
         return True
     return False
+
+
+async def back_in_form(update, context):
+    state = context.user_data
+    admin_form = any(state.get(key) for key in ('activity_mode', 'edit_class_mode', 'edit_nick_mode',
+                                               'gvg_poll', 'admin_poll_step', 'reject_mode'))
+    if admin_form and not is_admin(update.effective_user.id):
+        clear_input_state(context)
+        await update.message.reply_text('Доступно только администратору.')
+        await show_menu(update, context, 'main')
+        return True
+    if state.get('activity_mode'):
+        previous = {'confirm': 'upload', 'upload': 'select_date', 'select_date': 'select_activity'}
+        step = previous.get(state.get('activity_step'))
+        if step:
+            state['activity_step'] = step
+            await show_activity_step(update, context)
+        else:
+            clear_input_state(context)
+            await show_menu(update, context, 'admin')
+        return True
+    for mode, selected, restart in (
+        ('edit_class_mode', 'edit_class_user_id', edit_class_command),
+        ('edit_nick_mode', 'edit_target_user_id', edit_nick_command),
+    ):
+        if state.get(mode):
+            if selected in state:
+                await restart(update, context)
+            else:
+                clear_input_state(context)
+                await show_menu(update, context, 'clan')
+            return True
+    if state.get('gvg_poll'):
+        data = state['gvg_poll']
+        if data['step'] == 'datetime':
+            if data.get('gvg_list'):
+                data.update(data['gvg_list'].pop())
+                data['step'] = 'waiting_choice'
+            else:
+                clear_input_state(context)
+                await show_menu(update, context, 'polls')
+                return True
+        else:
+            data['step'] = 'datetime' if data['step'] == 'opponents' else 'opponents'
+        await show_gvg_step(update.message, data)
+        return True
+    if state.get('awaiting_class'):
+        clear_input_state(context)
+        state['awaiting_nick'] = True
+        await prompt_registration_nick(update)
+        return True
+    # Single-step forms return to the menu that opened them.
+    if any(state.get(key) for key in ('cash_order', 'reject_mode', 'admin_poll_step', 'awaiting_nick')):
+        menu = state.get('menu', 'main')
+        clear_input_state(context)
+        await show_menu(update, context, menu)
+        return True
+    return False
+
+
+async def prompt_registration_nick(update):
+    await update.message.reply_text('Регистрация → Шаг 1 из 2: игровой ник\nВведите ник вашего персонажа.',
+                                    reply_markup=form_keyboard(cancel='❌ Отменить регистрацию'))
+
+
+async def open_sheet(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text('Доступно только администратору.')
+        return
+    sheet_id = globals().get('GOOGLE_SHEET_ID')
+    if not sheet_id:
+        await update.message.reply_text('Ссылка недоступна: на хостинге не задан GOOGLE_SHEET_ID.')
+        return
+    await update.message.reply_text('Google-таблица клана:', reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton('📄 Открыть Google-таблицу', url=f'https://docs.google.com/spreadsheets/d/{sheet_id}/edit')]]))
 
 
 # ---------- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ----------
@@ -1657,14 +1773,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif is_pending(user_id):
         await update.message.reply_text("Ваша заявка ожидает подтверждения администратора.",reply_markup=get_main_keyboard(user_id))
     else:
-        await update.message.reply_text(
-            "⚠️ *Внимание!*\n"
-            "Бот будет использовать ваш игровой ник и ваш Telegram ID для идентификации.\n"
-            "Никакие другие персональные данные не собираются.\n\n"
-            "Для регистрации введите свой игровой ник.",
-            parse_mode="Markdown"
-        )
         context.user_data['awaiting_nick'] = True
+        await prompt_registration_nick(update)
 
 def escape_md(text):
     chars = r'_*[]()~`>#+-=|{}.!'
@@ -1677,7 +1787,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Доступно только администратору.')
         return
     users=get_all_users()
-    text='👥 Зарегистрированные игроки:\n'+'\n'.join(f'{nick} — {cls}' for _,nick,cls,_ in users)
+    text='Состав клана → Список игроков\n'+'\n'.join(f'{nick} — {cls}' for _,nick,cls,_ in users)
     await send_activity_report(update,text if users else 'Нет пользователей.',
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🆔 Показать ID',callback_data='show_all_ids')]]))
 
@@ -1696,7 +1806,7 @@ async def show_all_ids_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text
+    text = ui.canonical(update.message.text.strip())
 
     approve_admin_registration(user_id)
     if await route_navigation(update, context):
@@ -1737,7 +1847,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.user_data.get('cash_order'):
-        await update.message.reply_text('Ожидаю скриншот доната. Отправьте фото или нажмите «❌ Отмена».')
+        await update.message.reply_text('Ожидаю скриншот доната. Отправьте фото или нажмите «❌ Отменить заявку».')
         return
 
     # Регистрация: ник
@@ -1752,7 +1862,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['temp_nick'] = nick
         context.user_data['awaiting_nick'] = False
         context.user_data['awaiting_class'] = True
-        await update.message.reply_text("Отлично! Теперь выберите класс вашего персонажа:", reply_markup=get_class_keyboard())
+        await update.message.reply_text(f'Регистрация → {nick}\nШаг 2 из 2: выберите класс персонажа.', reply_markup=get_class_keyboard())
         return
 
     # Регистрация: класс
@@ -1763,12 +1873,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_nick_taken(nick):
                 clear_input_state(context)
                 context.user_data['awaiting_nick']=True
-                await update.message.reply_text('Этот ник уже занят или ожидает подтверждения. Введите другой ник.')
+                await update.message.reply_text('Этот ник уже занят или ожидает подтверждения. Введите другой ник.',
+                                                reply_markup=form_keyboard(cancel='❌ Отменить регистрацию'))
                 return
             context.user_data.pop('temp_nick')
             user_class = text.upper()
             add_pending_user(user_id, nick, user_class)
-            context.user_data.pop('awaiting_class', None)
+            clear_input_state(context)
             if is_admin(user_id):
                 approve_admin_registration(user_id)
                 await update.message.reply_text(
@@ -1826,13 +1937,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif text == "❓ Помощь":
         await update.message.reply_text(
-            'Регистрация и обновление меню: /start.\n'
-            '«Моя ЗП» — суммы за две половины текущего месяца из формул таблицы.\n'
-            '«Моя активность» — посещения, ПЛ, баллы и активка по мероприятиям.\n'
-            '«Мои ответы» — сохранённые ответы и повторное прохождение текущего опроса.\n'
-            '«Заказ кеша» — отправка скриншота доната администратору.\n'
-            '«Отмена» или /cancel отменяет текущий ввод.\n'
-            'По ошибкам в отметках и зарплате обратитесь к администратору.'
+            '«Моя зарплата» — суммы за две половины текущего месяца из таблицы.\n'
+            '«Мои посещения» — мероприятия, участие в роли ПЛ и баллы.\n'
+            '«Опрос ГВГ» — пройти опрос, посмотреть или изменить ответы.\n'
+            '«Заявка на кешбек» — отправить скриншот доната администратору.\n\n'
+            '«← Назад» возвращает на предыдущий шаг.\n'
+            '«Отменить…» или /cancel закрывает текущую операцию.\n'
+            '«🏠 Главное меню» или /menu возвращает на начальный экран.\n'
+            '/start — зарегистрироваться или обновить профиль.\n'
+            'По ошибкам в отметках и зарплате обратитесь к администратору.',
+            reply_markup=get_main_keyboard(user_id)
         )
     elif text == "💰 Заказ кеша":
         await cash_order_start(update, context)
@@ -1879,6 +1993,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif text == "🔄 Синхронизировать игроков" and is_admin(user_id):
         await sync_pa_command(update, context)
+    elif text == '📄 Открыть таблицу':
+        await open_sheet(update, context)
     else:
         await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
 
@@ -1912,15 +2028,20 @@ async def send_poll_to_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Рассылка инициирована. Первый вопрос отправлен {success} из {len(users)} пользователям.")
 
 def poll_keyboard(poll_id,index):
-    return InlineKeyboardMarkup([[
+    rows = [[
         InlineKeyboardButton('✅ Буду',callback_data=f'poll_{poll_id}_{index}_y'),
         InlineKeyboardButton('❌ Не буду',callback_data=f'poll_{poll_id}_{index}_n'),
-        InlineKeyboardButton('❓ Не знаю',callback_data=f'poll_{poll_id}_{index}_u')],
-        [InlineKeyboardButton('🔄 Пройти заново',callback_data=f'restart_{poll_id}')]])
+        InlineKeyboardButton('❓ Не знаю',callback_data=f'poll_{poll_id}_{index}_u')]]
+    if index:
+        rows.append([InlineKeyboardButton(ui.BACK, callback_data=f'pollback_{poll_id}_{index-1}')])
+    rows.append([InlineKeyboardButton('🔄 Пройти заново',callback_data=f'restart_{poll_id}'),
+                 InlineKeyboardButton('❌ Отменить опрос',callback_data=f'pollcancel_{poll_id}')])
+    return InlineKeyboardMarkup(rows)
 
 
 def poll_question(poll,index):
-    return f"📢 {poll['text']}\nВстреча {index+1} из {len(poll['meetings'])}:\n{poll['meetings'][index]}"
+    return (f"Опрос ГВГ → Вопрос {index+1} из {len(poll['meetings'])}\n{poll['text']}\n\n{poll['meetings'][index]}"
+            + '\n\nВыберите ответ. В конце опроса потребуется подтвердить сохранение.')
 
 
 async def send_first_question(chat_id: int, poll: dict, context: ContextTypes.DEFAULT_TYPE):
@@ -1962,7 +2083,44 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary='Проверьте ответы:\n'+'\n'.join(f"{m}: {session['answers'][m]}" for m in poll['meetings'])
         await query.edit_message_text(summary,reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton('✅ Сохранить ответы',callback_data=f'confirm_{poll_id}')],
+            [InlineKeyboardButton(ui.BACK,callback_data=f'pollback_{poll_id}_{index}')],
+            [InlineKeyboardButton('❌ Отменить опрос',callback_data=f'pollcancel_{poll_id}')],
             [InlineKeyboardButton('🔄 Пройти заново',callback_data=f'restart_{poll_id}')]]))
+
+
+async def poll_navigation_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_user_valid(query.from_user.id):
+        await query.message.reply_text('Вы не зарегистрированы. Нажмите /start.')
+        return
+    poll = get_active_poll()
+    try:
+        parts = query.data.split('_')
+        poll_id = int(parts[1])
+    except (ValueError, IndexError):
+        await query.message.reply_text('Некорректная кнопка опроса.')
+        return
+    if not poll or poll['id'] != poll_id:
+        await query.edit_message_text('Этот опрос уже не активен.')
+        return
+    if parts[0] == 'pollcancel':
+        context.user_data.pop('poll_session', None)
+        await query.edit_message_text('Прохождение опроса отменено. Новые ответы не сохранены.',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Пройти опрос', callback_data=f'restart_{poll_id}')]]))
+        return
+    session = context.user_data.get('poll_session')
+    try:
+        target = int(parts[2])
+    except (ValueError, IndexError):
+        target = -1
+    if not session or session['id'] != poll_id or not 0 <= target < min(session['next'], len(poll['meetings'])):
+        await query.message.reply_text('Эта кнопка устарела. Откройте «🗳 Опрос ГВГ» и пройдите опрос заново.')
+        return
+    for meeting in poll['meetings'][target:]:
+        session['answers'].pop(meeting, None)
+    session['next'] = target
+    await query.edit_message_text(poll_question(poll, target), reply_markup=poll_keyboard(poll_id, target))
 
 
 async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1987,7 +2145,7 @@ async def confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     save_responses(query.from_user.id,poll_id,session['answers'])
     context.user_data.pop('poll_session',None)
-    await query.edit_message_text('✅ Ответы сохранены. Посмотреть их можно в «Мои ответы».')
+    await query.edit_message_text('✅ Ответы сохранены. Посмотреть или изменить их можно через «🗳 Опрос ГВГ» в главном меню.')
 
 
 async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2005,11 +2163,15 @@ async def restart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+    clear_input_state(context)
+    context.user_data.pop('poll_session', None)
+    await show_menu(update, context, 'main')
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_input_state(context)
+    context.user_data.pop('poll_session', None)
+    await update.message.reply_text('Операция отменена. Несохранённые данные этой операции не записаны.')
     await show_menu(update, context, context.user_data.get('menu', 'main'))
 
 
@@ -2028,7 +2190,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'photo':
         await handle_cash_order_photo(update, context)
         return
-    await update.message.reply_text("Если хотите заказать кеш, нажмите кнопку «💰 Заказ кеша». Для активности используйте пункт «📊 Активность игроков».")
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text('Для отметки посещения нажмите «📸 Отметить посещение» в панели администратора. '
+                                        'Для кешбека выберите «💸 Заявка на кешбек» в главном меню.')
+    else:
+        await update.message.reply_text('Для отправки скриншота доната сначала нажмите «💸 Заявка на кешбек».')
 
 # ---------- ЗАПУСК ----------
 async def post_init(app: Application):
@@ -2060,6 +2226,7 @@ def build_application():
     app.add_handler(CallbackQueryHandler(poll_callback, pattern="^poll_"))
     app.add_handler(CallbackQueryHandler(confirm_callback, pattern="^confirm_"))
     app.add_handler(CallbackQueryHandler(restart_callback, pattern="^restart_"))
+    app.add_handler(CallbackQueryHandler(poll_navigation_callback, pattern='^(pollback_|pollcancel_)'))
     app.add_handler(CallbackQueryHandler(cash_callback, pattern="^(cash_done_|cash_reject_)"))
     app.add_handler(CallbackQueryHandler(gvg_callback, pattern="^(gvg_add_more|gvg_finish)"))
     app.add_handler(CommandHandler("leave", leave_chat))

@@ -202,7 +202,7 @@ class Buttons(unittest.IsolatedAsyncioTestCase):
         await self.text('NewLeader')
         self.assertEqual(self.ns['get_user_nick'](1),'NewLeader')
         self.assertEqual(self.ns['get_user_id_by_nick']('newleader'),1)
-        self.assertEqual(self.context.user_data['menu'],'profile')
+        self.assertEqual(self.context.user_data['menu'],'clan')
 
     async def test_sheet_edit_failure_does_not_change_database_profile(self):
         self.prepare()
