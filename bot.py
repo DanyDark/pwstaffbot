@@ -9,7 +9,7 @@ import asyncio
 import sheet_layout as attendance
 import bot_ui as ui
 from contextlib import closing
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -498,7 +498,7 @@ def get_google_spreadsheet():
 
 def get_or_create_monthly_activity_sheet(spreadsheet):
     year, month = attendance.moscow_month()
-    return attendance.ensure_month(spreadsheet, year, month)
+    return attendance.ensure_month(spreadsheet, year, month, users=get_all_users())
 
 
 def get_current_activity_sheet():
@@ -607,7 +607,18 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def sync_pa_internal():
-    return reconcile_sheet_profiles(get_current_activity_sheet(), get_all_users())
+    with attendance.MONTH_LOCK:
+        return reconcile_sheet_profiles(get_current_activity_sheet(), get_all_users())
+
+
+async def refresh_activity_month():
+    if not GOOGLE_CREDS_JSON or not GOOGLE_SHEET_ID:
+        return
+    try:
+        await asyncio.to_thread(sync_pa_internal)
+        logging.info('Месячный лист активности и состав проверены')
+    except Exception:
+        logging.exception('Не удалось обновить месячный лист; проверка будет повторена автоматически')
 
 
 def reconcile_sheet_profiles(ws, users):
@@ -1021,9 +1032,13 @@ async def show_activity_step(update, context):
         text = activity_heading(state, 1, 'мероприятие') + 'Выберите мероприятие.'
         keyboard = form_keyboard([[e] for e in attendance.EVENTS], cancel='❌ Отменить загрузку')
     elif step == 'select_date':
-        dates = sorted(state['activity_dates'], key=lambda value: datetime.strptime(value, '%d.%m.%Y'))
-        text = activity_heading(state, 2, 'дата') + 'Выберите дату мероприятия из таблицы.'
-        keyboard = form_keyboard([[d] for d in dates], cancel='❌ Отменить загрузку')
+        text = (activity_heading(state, 2, 'дата')
+                + 'Нажмите «Сегодня» или «Вчера», либо введите дату: ДД.ММ.ГГГГ (можно ДД.ММ).\n'
+                + 'Доступны прошедшие даты текущего месяца по Москве. Бот сам запишет дату в таблицу при сохранении.')
+        quick = ['📅 Сегодня']
+        if attendance.moscow_today().day > 1:
+            quick.append('📅 Вчера')
+        keyboard = form_keyboard([quick], cancel='❌ Отменить загрузку')
     elif step == 'upload':
         text = (activity_heading(state, 3, 'скриншоты')
                 + f"Принято скриншотов: {state.get('activity_screenshots', 0)}. "
@@ -1135,20 +1150,19 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             ws = await asyncio.to_thread(get_current_activity_sheet)
             if state.get('activity_screenshots') and ws.title != state.get('activity_sheet'):
                 raise ValueError('Месяц сменился. Начните загрузку заново.')
-            rows = await asyncio.to_thread(ws.get_all_values)
-            dates = attendance.event_dates(rows, text, year, month)
-            if not dates:
-                raise ValueError('В заголовках события нет дат. Заполните даты в месячном листе.')
-            state.update(activity_event=text, activity_dates=dates, activity_step='select_date', activity_sheet=ws.title)
+            state.update(activity_event=text, activity_step='select_date', activity_sheet=ws.title)
             await show_activity_step(update, context)
         elif step == 'select_date':
-            if text not in state['activity_dates']:
-                await update.message.reply_text('Выберите дату из кнопок.')
-                return
+            if text == '📅 Сегодня':
+                text = attendance.moscow_today().strftime('%d.%m.%Y')
+            elif text == '📅 Вчера':
+                text = (attendance.moscow_today() - timedelta(days=1)).strftime('%d.%m.%Y')
+            text = attendance.parse_event_date(text, year, month)
             ws = await asyncio.to_thread(get_current_activity_sheet)
             if ws.title != state['activity_sheet']:
                 raise ValueError('Месяц сменился. Начните загрузку заново.')
             rows = await asyncio.to_thread(ws.get_all_values)
+            attendance.event_date_slot(rows, state['activity_event'], text, year, month)
             state.update(activity_date=text, activity_step='upload',
                          activity_known=[nick for _, nick in attendance.players(rows)])
             for key in ('activity_nicks', 'activity_leaders', 'activity_unknown'):
@@ -1171,12 +1185,8 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             ws = await asyncio.to_thread(get_current_activity_sheet)
             if ws.title != state['activity_sheet']:
                 raise ValueError('Месяц сменился. Начните заново.')
-            rows = await asyncio.to_thread(ws.get_all_values)
-            dates = attendance.event_dates(rows, state['activity_event'], year, month)
-            col = dates.get(state['activity_date'])
-            if col is None:
-                raise ValueError('Дата удалена из таблицы. Начните заново.')
-            count, missing = await asyncio.to_thread(attendance.mark_attendance, ws, col,
+            count, missing = await asyncio.to_thread(attendance.save_event_attendance,
+                ws, state['activity_event'], state['activity_date'], year, month,
                 state['activity_nicks'], state['activity_leaders'])
             event, date = state['activity_event'], state['activity_date']
             clear_input_state(context)
@@ -2200,9 +2210,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone='Europe/Moscow')
     schedule_boss_announcements(scheduler)
+    scheduler.add_job(refresh_activity_month, 'cron', hour=0, minute=0,
+                      id='activity_month_midnight', coalesce=True, misfire_grace_time=3600)
+    scheduler.add_job(refresh_activity_month, 'interval', hours=1,
+                      id='activity_month_retry', coalesce=True, max_instances=1)
     scheduler.start()
     app.bot_data['scheduler'] = scheduler
     logging.info("Планировщик объявлений запущен")
+    await refresh_activity_month()
 
 def build_application():
     global app

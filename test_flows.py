@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 import json
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, date
 from decimal import Decimal, InvalidOperation
 from contextlib import closing
 from pathlib import Path
@@ -32,7 +32,7 @@ def load_functions():
             nodes.append(node)
     namespace = dict(sqlite3=sqlite3, os=os, logging=logging, closing=closing,
                      asyncio=asyncio, attendance=attendance, ui=ui,
-                     Decimal=Decimal, InvalidOperation=InvalidOperation, json=json, datetime=datetime, time=time,
+                     Decimal=Decimal, InvalidOperation=InvalidOperation, json=json, datetime=datetime, time=time, timedelta=timedelta,
                      InlineKeyboardButton=lambda text,callback_data=None,url=None: SimpleNamespace(text=text,callback_data=callback_data,url=url),
                      InlineKeyboardMarkup=lambda rows: SimpleNamespace(inline_keyboard=rows),
                      KeyboardButton=lambda text: text,
@@ -43,6 +43,9 @@ def load_functions():
 
 class BotFlows(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        today = patch.object(attendance, 'moscow_today', return_value=date(2026, 10, 31))
+        today.start()
+        self.addCleanup(today.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.ns = load_functions()
         self.ns.update(DB_FILE=str(Path(self.tmp.name) / 'users.db'), ADMIN_LIST=[1])

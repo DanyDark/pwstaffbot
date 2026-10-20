@@ -105,14 +105,15 @@ class Navigation(unittest.IsolatedAsyncioTestCase):
                 await self.text(ui.SAVE_ATTENDANCE)
                 self.assertEqual(self.ws.updates, [])
 
-    async def test_dates_are_shown_in_chronological_order(self):
+    async def test_date_selection_uses_quick_buttons_instead_of_sheet_dates(self):
         self.prepare()
         self.ws.rows[2][29:33] = ['24', '13', '20', '27']
         with patch.object(attendance, 'moscow_month', return_value=(2026, 10)):
             await self.text('📸 Отметить посещение')
             await self.text('ГВГ')
         keyboard = self.update.message.reply_text.call_args.kwargs['reply_markup']
-        self.assertEqual(keyboard[:4], [['13.10.2026'], ['20.10.2026'], ['24.10.2026'], ['27.10.2026']])
+        self.assertEqual(keyboard[0], ['📅 Сегодня', '📅 Вчера'])
+        self.assertIn('ДД.ММ.ГГГГ', self.update.message.reply_text.call_args.args[0])
 
     async def test_profile_back_returns_to_player_selection_then_clan(self):
         self.prepare()

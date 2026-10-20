@@ -50,6 +50,13 @@ class Worksheet:
 
     def batch_clear(self, ranges):
         self.clears.extend(ranges)
+        for address in ranges:
+            letters = ''.join(c for c in address if c.isalpha())
+            row = int(''.join(c for c in address if c.isdigit()))
+            col = 0
+            for char in letters:
+                col = col * 26 + ord(char) - 64
+            self.rows[row - 1][col - 1] = ''
 
 
 class NotFound(Exception):
@@ -70,7 +77,7 @@ class Spreadsheet:
         return list(self.sheets.values())
 
     def duplicate(self, insert_sheet_index, new_sheet_name):
-        ws = Worksheet(new_sheet_name)
+        ws = Worksheet(new_sheet_name, self.sheets['Новый шаблон'].rows)
         self.sheets[new_sheet_name] = ws
         return ws
 
@@ -207,8 +214,8 @@ class SheetLayoutTests(unittest.TestCase):
             self.assertIn('G5',ws.clears)
             self.assertIn('AL5',ws.clears)
             self.assertNotIn('AJ5',ws.clears)
-            self.assertNotIn('G4',ws.clears)
-            self.assertEqual(ws.rows[3][6],'11.11.2026')
+            self.assertIn('G4',ws.clears)
+            self.assertEqual(ws.rows[3][6],'')
             self.assertIs(a.ensure_month(book,2026,11),ws)
         self.assertEqual(book.worksheet('Новый шаблон').rows,original)
 

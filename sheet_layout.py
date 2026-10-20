@@ -56,8 +56,10 @@ def layout(rows):
         event_columns[event] = list(range(start, end))
     first_player = next((i for i in range(index + 1, len(rows))
                          if str(cell(rows[i], headers['НИК'])).strip() and not class_of_row(rows[i])), len(rows))
+    first_class = next((i for i in range(index + 1, len(rows)) if class_of_row(rows[i])), first_player - 1)
     return {'header': index + 1, 'nick': headers['НИК'], 'headers': headers,
-            'events': event_columns, 'first_player': first_player + 1}
+            'events': event_columns, 'first_player': first_player + 1,
+            'date_rows': list(range(index + 2, min(first_class + 2, first_player + 1)))}
 
 
 def players(rows, spec=None):
@@ -68,6 +70,15 @@ def players(rows, spec=None):
         nick = str(cell(row, spec['nick'])).strip()
         if nick and label(nick) not in ('НИК', 'ИТОГО', 'ИТОГ', 'ВСЕГО'):
             yield i, nick
+
+
+def player_data_rows(rows, spec):
+    """Include empty nickname rows: they can still contain old marks."""
+    last_date_row = max(spec['date_rows'], default=spec['header'])
+    totals = {'ИТОГО', 'ИТОГ', 'ВСЕГО'}
+    return [r for r, row in enumerate(rows, 1)
+            if r > last_date_row and not class_of_row(row)
+            and not any(label(cell(row, col)) in totals for col in (1, 2, spec['nick']))]
 
 
 def day_number(value):
@@ -93,8 +104,8 @@ def event_dates(rows, event, year, month):
     result = {}
     for col in spec['events'][event]:
         # Dates can be above or on a class header row, but never in player rows.
-        for row_index in range(spec['header'], spec['first_player'] - 1):
-            day = day_number(cell(rows[row_index], col))
+        for row_number in spec['date_rows']:
+            day = day_number(cell(rows[row_number - 1], col))
             if day and day <= calendar.monthrange(year, month)[1]:
                 date = f'{day:02d}.{month:02d}.{year}'
                 if date in result:
@@ -104,7 +115,58 @@ def event_dates(rows, event, year, month):
     return result
 
 
-def mark_attendance(ws, column, nick_rows, leader):
+def parse_event_date(value, year, month):
+    """The administrator supplies dates independently of worksheet headings."""
+    text = str(value).strip()
+    if re.fullmatch(r'\d{1,2}\.\d{1,2}', text):
+        text += f'.{year}'
+    try:
+        date = datetime.strptime(text, '%d.%m.%Y').date()
+    except ValueError:
+        raise ValueError('Введите существующую дату в формате ДД.ММ.ГГГГ.') from None
+    if (date.year, date.month) != (year, month):
+        raise ValueError('Выберите дату текущего месяца по московскому времени.')
+    if date > moscow_today():
+        raise ValueError('Нельзя отметить посещение за будущую дату.')
+    return date.strftime('%d.%m.%Y')
+
+
+def event_date_slot(rows, event, date, year, month):
+    date = parse_event_date(date, year, month)
+    spec = layout(rows)
+    existing = event_dates(rows, event, year, month)
+    if date in existing:
+        return existing[date], None
+    # The template's formulas divide each event block into two salary periods:
+    # RB 7+7, Komendant 2+3, Banshee 2+2, GVG 2+2. Never shift these columns.
+    columns = spec['events'][event]
+    split = len(columns) // 2
+    candidates = columns[:split] if int(date[:2]) <= 15 else columns[split:]
+    candidates = sorted(candidates, key=lambda col: any(
+        str(cell(rows[r - 1], col)).strip() for r in spec['date_rows']))
+    for col in candidates:
+        occupied = [r for r in spec['date_rows'] if str(cell(rows[r - 1], col)).strip()]
+        # Only an unused, unambiguous planned date can be replaced.
+        if len(occupied) > 1 or any(not day_number(cell(rows[r - 1], col)) for r in occupied):
+            continue
+        # Include unnamed rows so old attendance cannot acquire a new date.
+        if any(str(cell(rows[r - 1], col)).strip() not in ('', '0') for r in player_data_rows(rows, spec)):
+            continue
+        if not spec['date_rows']:
+            raise ValueError('В шаблоне нет строки для дат под заголовками мероприятий.')
+        return col, {'range': a1(col, occupied[0] if occupied else spec['date_rows'][0]), 'values': [[date]]}
+    raise ValueError(f'Для {event} нет свободной колонки в этой половине месяца. '
+                     'Проверьте заголовки и разметку таблицы; существующие отметки сохранены.')
+
+
+def save_event_attendance(ws, event, date, year, month, nicks, leaders):
+    with MONTH_LOCK:
+        rows = ws.get_all_values(value_render_option='FORMULA')
+        column, heading = event_date_slot(rows, event, date, year, month)
+        return mark_attendance(ws, column, nicks, leaders, heading)
+
+
+def mark_attendance(ws, column, nick_rows, leader, heading=None):
     leaders = {leader} if isinstance(leader, str) else set(leader or [])
     rows = ws.get_all_values()
     formula_rows = ws.get_all_values(value_render_option='FORMULA')
@@ -133,17 +195,20 @@ def mark_attendance(ws, column, nick_rows, leader):
         value = max(int(current or 0), desired)
         if str(value) != current:
             updates.append({'range': a1(column, row), 'values': [[value]]})
+    count = len(updates)
+    if heading and updates:
+        updates.insert(0, heading)
     if updates:
         ws.batch_update(updates, value_input_option='RAW')
-    return len(updates), missing
+    return count, missing
 
 
-def ensure_month(spreadsheet, year, month):
+def ensure_month(spreadsheet, year, month, users=None):
     with MONTH_LOCK:
-        return _ensure_month(spreadsheet, year, month)
+        return _ensure_month(spreadsheet, year, month, users)
 
 
-def _ensure_month(spreadsheet, year, month):
+def _ensure_month(spreadsheet, year, month, users=None):
     import gspread
     base = f'Активность {month:02d}.{year}'
     for name in (base, base + ' (136)'):
@@ -165,30 +230,27 @@ def _ensure_month(spreadsheet, year, month):
         raise ValueError(f'Лист {name} существует, но имеет неподходящий формат.')
     formulas = template.get_all_values(value_render_option='FORMULA')
     ws = template.duplicate(insert_sheet_index=0, new_sheet_name=name)
-    ranges = [a1(c, r) for r, _ in players(source, spec) for cols in spec['events'].values() for c in cols
+    player_rows = player_data_rows(source, spec)
+    ranges = [a1(c, r) for r in player_rows for cols in spec['events'].values() for c in cols
               if not str(cell(formulas[r - 1], c)).startswith('=')]
     captain = spec['headers'].get('КАПИТАНСКИЕ')
     if captain:
-        ranges += [a1(captain, r) for r, _ in players(source, spec)
+        ranges += [a1(captain, r) for r in player_rows
                    if not str(cell(formulas[r - 1], captain)).startswith('=')]
-    date_updates = []
+    if users is not None:
+        ranges += [a1(spec['nick'], r) for r in player_rows]
+        note = spec['headers'].get('ПРИМЕЧАНИЕ')
+        if note:
+            ranges += [a1(note, r) for r in player_rows
+                       if not str(cell(formulas[r - 1], note)).startswith('=')]
     for cols in spec['events'].values():
         for col in cols:
-            for index in range(spec['header'], spec['first_player'] - 1):
-                value = cell(source[index], col)
-                day = day_number(value)
-                if day:
-                    if day > calendar.monthrange(year, month)[1]:
-                        ranges.append(a1(col, index + 1))
-                    elif not str(value).strip().isdigit() or float(str(value).strip()) > 31:
-                        date_updates.append({'range': a1(col, index + 1),
-                                             'values': [[f'{day:02d}.{month:02d}.{year}']]})
-                    break
+            ranges += [a1(col, r) for r in spec['date_rows'] if day_number(cell(source[r - 1], col))]
     try:
         if ranges:
             ws.batch_clear(ranges)
-        if date_updates:
-            ws.batch_update(date_updates, value_input_option='USER_ENTERED')
+        if users is not None:
+            sync_players(ws, users)
     except Exception:
         # Only the newly created, incompletely initialized sheet is removed.
         spreadsheet.del_worksheet(ws)
@@ -242,8 +304,12 @@ def sync_players(ws, users):
 
 
 def moscow_month():
-    now = datetime.now(ZoneInfo('Europe/Moscow'))
+    now = moscow_today()
     return now.year, now.month
+
+
+def moscow_today():
+    return datetime.now(ZoneInfo('Europe/Moscow')).date()
 
 
 def player_stats(ws, nick):
