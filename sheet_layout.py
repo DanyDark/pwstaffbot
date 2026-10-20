@@ -105,6 +105,7 @@ def event_dates(rows, event, year, month):
 
 
 def mark_attendance(ws, column, nick_rows, leader):
+    leaders = {leader} if isinstance(leader, str) else set(leader or [])
     rows = ws.get_all_values()
     formula_rows = ws.get_all_values(value_render_option='FORMULA')
     available = {}
@@ -125,7 +126,7 @@ def mark_attendance(ws, column, nick_rows, leader):
         current = str(cell(rows[row - 1], column)).strip()
         if str(cell(formula_rows[row - 1], column)).startswith('='):
             raise ValueError(f'В {a1(column, row)} находится формула; запись отменена.')
-        desired = 2 if nick == leader else 1
+        desired = 2 if nick in leaders else 1
         if current not in ('', '0', '1', '2'):
             raise ValueError(f'В {a1(column, row)} уже есть нестандартная отметка; запись отменена.')
         # Repeated screenshots cannot reduce a PL mark or create another attendance.

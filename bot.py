@@ -405,8 +405,9 @@ def extract_nicks_from_image(image_bytes):
         lines = [line.strip() for line in parsed_text.splitlines() if line.strip()]
         nicks = []
         for line in lines:
-            if len(line) >= 2 and not line.isdigit():
-                nicks.append(line)
+            # Keep the first OCR line even if it looks invalid: dropping it
+            # would silently promote the next player to party leader.
+            nicks.append(line)
         return nicks
     except Exception as e:
         logging.error(f"Ошибка OCR.space: {e}")
@@ -901,60 +902,90 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- АКТИВНОСТЬ ИГРОКОВ ----------
 async def activity_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("Доступно только администратору.")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text('Доступно только администратору.')
         return
-    context.user_data['activity_mode'] = True
-    keyboard = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
-    await update.message.reply_text(
-        "📸 Отправьте скриншот (фото) со списком ников игроков.\nПосле распознавания вы сможете выбрать активность.\n\nДоступные активности: РБ, Комендант, Баньши, ГВГ.\n\nДля отмены нажмите «❌ Отмена».",
-        reply_markup=keyboard
-    )
+    clear_input_state(context)
+    context.user_data.update(activity_mode=True, activity_step='select_activity')
+    await update.message.reply_text('Выберите мероприятие, затем дату и загрузите скриншоты.',
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(e)] for e in attendance.EVENTS]
+            + [[KeyboardButton('❌ Отмена')]], resize_keyboard=True))
 
-def sort_sheet_by_class(worksheet):
-    all_values = worksheet.get_all_values()
-    if len(all_values) < 2:
-        return
-    headers = all_values[0]
-    data = all_values[1:]
-    if len(headers) < 2:
-        return
-    data_sorted = sorted(data, key=lambda row: row[1].strip() if len(row) > 1 else "")
-    new_values = [headers] + data_sorted
-    worksheet.clear()
-    if new_values:
-        worksheet.update(values=new_values, range_name='A1')
+
+def upload_keyboard():
+    return ReplyKeyboardMarkup([[KeyboardButton('ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ')],
+                               [KeyboardButton('❌ Отмена')]], resize_keyboard=True)
+
+
+async def send_activity_report(update, text, reply_markup=None):
+    # Multiple screenshots can produce a report longer than one Telegram message.
+    while len(text) > 3500:
+        await update.message.reply_text(text[:3500])
+        text = text[3500:]
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+def accumulate_screenshot(state, raw, known):
+    # Only exact normalized names are accepted automatically. OCR guesses must
+    # never award attendance or leadership to a different player.
+    canonical = {}
+    for nick in known:
+        canonical.setdefault(nick.strip().casefold(), []).append(nick)
+    recognized, unknown = [], []
+    mapped = {}
+    for value in raw:
+        matches = list(dict.fromkeys(canonical.get(value.strip().casefold(), [])))
+        if len(matches) == 1:
+            mapped[value] = matches[0]
+            recognized.append(matches[0])
+        else:
+            unknown.append(value)
+    nicks = state.setdefault('activity_nicks', [])
+    leaders = state.setdefault('activity_leaders', [])
+    missing = state.setdefault('activity_unknown', [])
+    for nick in recognized:
+        if nick not in nicks:
+            nicks.append(nick)
+    for nick in unknown:
+        if nick not in missing:
+            missing.append(nick)
+    top = raw[0] if raw else None
+    leader = mapped.get(top)
+    if leader and leader not in leaders:
+        leaders.append(leader)
+    return list(dict.fromkeys(recognized)), unknown, leader
+
 
 async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id) or not context.user_data.get('activity_mode'):
+    state = context.user_data
+    if not is_admin(update.effective_user.id) or not state.get('activity_mode'):
+        return
+    if state.get('activity_step') != 'upload':
+        await update.message.reply_text('Сначала выберите мероприятие и дату. Для новой загрузки откройте «Активность игроков».')
         return
     try:
         photo_file = await update.message.photo[-1].get_file()
         image = await photo_file.download_as_bytearray()
-        await update.message.reply_text("🔍 Распознаю ники...")
+        await update.message.reply_text('🔍 Распознаю скриншот...')
         raw = await asyncio.to_thread(extract_nicks_from_image, bytes(image))
         if not raw:
-            await update.message.reply_text("Ники не распознаны. Пришлите более чёткий скриншот списка игроков.")
+            await update.message.reply_text('⚠️ На скриншоте не удалось прочитать ники. '
+                'Проверьте изображение и отметьте игроков вручную в таблице либо пришлите более чёткий скриншот.',
+                reply_markup=upload_keyboard())
             return
-        ws = await asyncio.to_thread(get_current_activity_sheet)
-        rows = await asyncio.to_thread(ws.get_all_values)
-        known = [nick for _, nick in attendance.players(rows)]
-        matched, unmatched = fuzzy_match_nicks(raw, known, threshold=80)
-        nicks = list(dict.fromkeys(matched[r] for r in raw if r in matched))
-        if not nicks:
-            await update.message.reply_text("Распознанные ники не найдены в месячной таблице. Проверьте состав игроков.")
-            return
-        context.user_data.update(activity_nicks=nicks, activity_sheet=ws.title,
-                                 activity_step='select_activity')
-        await update.message.reply_text(
-            "Проверьте распознанных игроков:\n" + ', '.join(nicks)
-            + ("\nНе сопоставлены и не будут записаны: " + ', '.join(unmatched) if unmatched else '')
-            + "\nВыберите событие. Запись будет только после подтверждения.",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(e)] for e in attendance.EVENTS]
-                                             + [[KeyboardButton("❌ Отмена")]], resize_keyboard=True))
+        recognized, unknown, leader = accumulate_screenshot(state, raw, state['activity_known'])
+        state['activity_screenshots'] += 1
+        await send_activity_report(update,
+            f"Скриншот №{state['activity_screenshots']}. Определены: " + (', '.join(recognized) or 'нет')
+            + ('\nПЛ: ' + leader if leader else '\n⚠️ Верхний ник «' + raw[0]
+               + '» не определён. ПЛ не назначен; отметьте его вручную в таблице значением 2.')
+            + ('\n⚠️ Не определены: ' + ', '.join(unknown)
+               + '. Проверьте эти ники на скриншоте и отметьте их вручную в таблице.' if unknown else '')
+            + f"\nВсего уникальных игроков: {len(state['activity_nicks'])}."
+            + '\nЗагрузите следующий скриншот или завершите загрузку.',
+            reply_markup=upload_keyboard())
     except Exception as exc:
-        await update.message.reply_text(f"❌ Распознавание не завершено: {exc}")
+        await update.message.reply_text(f'❌ Скриншот не обработан: {exc}. Можно повторить отправку или отметить игроков вручную.')
 
 
 async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -970,8 +1001,7 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
                 await update.message.reply_text('Выберите событие из кнопок.')
                 return
             ws = await asyncio.to_thread(get_current_activity_sheet)
-            if ws.title != state['activity_sheet']:
-                raise ValueError('Месяц сменился. Пришлите скриншот заново.')
+            state['activity_sheet'] = ws.title
             rows = await asyncio.to_thread(ws.get_all_values)
             dates = attendance.event_dates(rows, text, year, month)
             if not dates:
@@ -983,18 +1013,32 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             if text not in state['activity_dates']:
                 await update.message.reply_text('Выберите дату из кнопок.')
                 return
-            state.update(activity_date=text, activity_step='select_leader')
-            await update.message.reply_text('Кто ПЛ? Ему будет поставлено 2, остальным 1.',
-                reply_markup=ReplyKeyboardMarkup([[KeyboardButton(n)] for n in state['activity_nicks']]
-                    + [[KeyboardButton('Без ПЛ')], [KeyboardButton('❌ Отмена')]], resize_keyboard=True))
-        elif step == 'select_leader':
-            if text not in state['activity_nicks'] and text != 'Без ПЛ':
-                await update.message.reply_text('Выберите ПЛ из распознанных игроков или «Без ПЛ».')
-                return
-            state.update(activity_leader=None if text == 'Без ПЛ' else text, activity_step='confirm')
+            ws = await asyncio.to_thread(get_current_activity_sheet)
+            if ws.title != state['activity_sheet']:
+                raise ValueError('Месяц сменился. Начните загрузку заново.')
+            rows = await asyncio.to_thread(ws.get_all_values)
+            state.update(activity_date=text, activity_step='upload', activity_nicks=[],
+                         activity_leaders=[], activity_unknown=[], activity_screenshots=0,
+                         activity_known=[nick for _, nick in attendance.players(rows)])
             await update.message.reply_text(
-                f"Лист: {state['activity_sheet']}\n{state['activity_event']} — {state['activity_date']}"
-                + f"\nПЛ: {text}\nИгроки: " + ', '.join(state['activity_nicks']),
+                f"{state['activity_event']} — {text}.\nЗагружайте скриншоты. Верхний игрок каждого скриншота — ПЛ."
+                + '\nКогда все скриншоты отправлены, нажмите «ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ».',
+                reply_markup=upload_keyboard())
+        elif step == 'upload':
+            if text != 'ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ':
+                await update.message.reply_text('Отправьте скриншот либо нажмите «ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ».')
+                return
+            if not state['activity_screenshots'] or not state['activity_nicks']:
+                await update.message.reply_text('Пока нет определённых игроков. Загрузите скриншот или отмените операцию.')
+                return
+            state['activity_step'] = 'confirm'
+            await send_activity_report(update,
+                f"{state['activity_event']} — {state['activity_date']}\n"
+                + f"Скриншотов: {state['activity_screenshots']}. Игроков: {len(state['activity_nicks'])}.\n"
+                + 'ПЛ (2): ' + (', '.join(state['activity_leaders']) or 'не определены')
+                + '\nВсе игроки: ' + ', '.join(state['activity_nicks'])
+                + ('\n⚠️ Не определены: ' + ', '.join(state['activity_unknown'])
+                   + '. Заполните их вручную в таблице.' if state['activity_unknown'] else ''),
                 reply_markup=ReplyKeyboardMarkup([[KeyboardButton('✅ Записать')],
                                                   [KeyboardButton('❌ Отмена')]], resize_keyboard=True))
         elif step == 'confirm':
@@ -1010,10 +1054,10 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             if col is None:
                 raise ValueError('Дата удалена из таблицы. Начните заново.')
             count, missing = await asyncio.to_thread(attendance.mark_attendance, ws, col,
-                state['activity_nicks'], state['activity_leader'])
+                state['activity_nicks'], state['activity_leaders'])
             clear_input_state(context)
             await update.message.reply_text(f"✅ Обновлено отметок: {count}."
-                + (" Не найдены: " + ', '.join(missing) if missing else ''), reply_markup=get_main_keyboard(update.effective_user.id))
+                + (" Не найдены: " + ', '.join(missing) + '. Отметьте их вручную в таблице.' if missing else ''), reply_markup=get_main_keyboard(update.effective_user.id))
     except Exception as exc:
         await update.message.reply_text(f"❌ Запись не выполнена: {exc}\nМожно отменить операцию и начать заново.")
 
@@ -1862,7 +1906,7 @@ async def end_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('activity_mode') and not context.user_data.get('activity_step'):
+    if context.user_data.get('activity_mode'):
         await handle_activity_photo(update, context)
         return
     if context.user_data.get('cash_order') and context.user_data['cash_order'].get('step') == 'photo':

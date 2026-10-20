@@ -129,6 +129,11 @@ class SheetLayoutTests(unittest.TestCase):
             a.mark_attendance(ws,32,['Leader'],'Leader')
         self.assertEqual(ws.updates, [])
 
+    def test_multiple_leaders_from_separate_screenshots(self):
+        ws = Worksheet()
+        a.mark_attendance(ws,32,['Leader','Player','Warrior'],['Leader','Warrior'])
+        self.assertEqual([u['values'][0][0] for u in ws.updates],[2,1,2])
+
     def test_sync_keeps_existing_players_and_formulas(self):
         ws = Worksheet()
         count = a.sync_players(ws, [(1,'NewMage','МАГ'),(2,'Leader','МАГ'),(3,'NewWar','ВАР')])

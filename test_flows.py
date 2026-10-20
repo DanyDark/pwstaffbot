@@ -153,7 +153,7 @@ class BotFlows(unittest.IsolatedAsyncioTestCase):
         self.ns.update(OCR_SPACE_API_KEY='test-key', base64=base64,
                        requests=SimpleNamespace(post=post))
         result = self.ns['extract_nicks_from_image'](bytes.fromhex('ffd8ff') + b'image')
-        self.assertEqual(result, ['PlayerOne', 'PlayerTwo'])
+        self.assertEqual(result, ['PlayerOne', '123', 'PlayerTwo'])
         self.assertTrue(post.call_args.kwargs['data']['base64Image'].startswith('data:image/jpeg;'))
         response.raise_for_status.assert_called_once()
 
@@ -161,18 +161,73 @@ class BotFlows(unittest.IsolatedAsyncioTestCase):
         ws = Worksheet('Активность 10.2026 (136)')
         self.ns['get_current_activity_sheet'] = lambda: ws
         with patch.object(attendance, 'moscow_month', return_value=(2026,10)):
-            self.context.user_data.update(activity_mode=True, activity_nicks=['Leader','Player'],
-                activity_sheet=ws.title, activity_step='select_activity')
-            for text in ('ГВГ','20.10.2026','Leader'):
+            self.context.user_data.update(activity_mode=True, activity_step='select_activity')
+            for text in ('ГВГ','20.10.2026'):
                 self.update.message.text = text
                 await self.ns['handle_activity_choice'](self.update,self.context)
                 self.assertEqual(ws.updates, [])
+            self.assertEqual(self.context.user_data['activity_step'], 'upload')
+            self.ns['accumulate_screenshot'](self.context.user_data,['Leader','Player'],['Leader','Player'])
+            self.context.user_data['activity_screenshots'] = 1
+            self.update.message.text = 'ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ'
+            await self.ns['handle_activity_choice'](self.update,self.context)
+            self.assertEqual(ws.updates, [])
             self.assertEqual(self.context.user_data['activity_step'], 'confirm')
             self.update.message.text = '✅ Записать'
             await self.ns['handle_activity_choice'](self.update,self.context)
         self.assertEqual(len(ws.updates),2)
         self.assertEqual(ws.rows[4][31],'2')
         self.assertNotIn('activity_mode',self.context.user_data)
+
+    async def test_multiple_screenshots_accumulate_and_keep_each_leader(self):
+        state = {}
+        self.ns['accumulate_screenshot'](state,['Leader','Player'],['Leader','Player','Warrior'])
+        self.ns['accumulate_screenshot'](state,['Warrior','Player'],['Leader','Player','Warrior'])
+        self.assertEqual(state['activity_nicks'],['Leader','Player','Warrior'])
+        self.assertEqual(state['activity_leaders'],['Leader','Warrior'])
+
+    async def test_unknown_top_never_promotes_next_player(self):
+        state = {}
+        result = self.ns['accumulate_screenshot'](state,['Unkn0wn','Player'],['Player'])
+        self.assertEqual(state['activity_nicks'],['Player'])
+        self.assertEqual(state['activity_leaders'],[])
+        self.assertEqual(state['activity_unknown'],['Unkn0wn'])
+        self.assertIsNone(result[2])
+
+    async def test_unknown_nick_is_not_fuzzy_assigned_to_another_player(self):
+        state = {}
+        self.ns['accumulate_screenshot'](state,['P1ayer','Warrior'],['Player','Warrior'])
+        self.assertEqual(state['activity_nicks'],['Warrior'])
+        self.assertEqual(state['activity_leaders'],[])
+        self.assertEqual(state['activity_unknown'],['P1ayer'])
+
+    async def test_photo_warning_names_unknown_top_and_recommends_manual_entry(self):
+        self.context.user_data.update(activity_mode=True,activity_step='upload',
+            activity_known=['Player'],activity_screenshots=0)
+        self.ns['extract_nicks_from_image'] = lambda image: ['Unkn0wn','Player']
+        file = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(b'image')))
+        self.update.message.photo = [SimpleNamespace(get_file=AsyncMock(return_value=file))]
+        await self.ns['handle_photo'](self.update,self.context)
+        text = self.update.message.reply_text.call_args.args[0]
+        self.assertIn('Unkn0wn',text)
+        self.assertIn('вручную',text)
+        self.assertIn('ПЛ не назначен',text)
+        self.assertEqual(self.context.user_data['activity_step'],'upload')
+
+    async def test_finish_without_recognized_players_stays_in_upload(self):
+        self.context.user_data.update(activity_mode=True,activity_step='upload',
+            activity_screenshots=1,activity_nicks=[])
+        with patch.object(attendance,'moscow_month',return_value=(2026,10)):
+            self.update.message.text = 'ЗАВЕРШИТЬ ЗАГРУЗКУ СКРИНОВ'
+            await self.ns['handle_activity_choice'](self.update,self.context)
+        self.assertEqual(self.context.user_data['activity_step'],'upload')
+
+    async def test_large_upload_report_fits_telegram_messages(self):
+        await self.ns['send_activity_report'](self.update,'x'*8000,reply_markup='keyboard')
+        calls = self.update.message.reply_text.call_args_list
+        self.assertEqual(len(calls),3)
+        self.assertTrue(all(len(call.args[0]) <= 3500 for call in calls))
+        self.assertEqual(calls[-1].kwargs['reply_markup'],'keyboard')
 
     async def test_salary_is_read_from_table_without_writes(self):
         ws = Worksheet()
