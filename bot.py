@@ -20,6 +20,17 @@ from google.oauth2.service_account import Credentials
 # Нечёткое сравнение строк
 from rapidfuzz import fuzz
 
+# Классы стандартной версии Perfect World 1.3.6.
+CHARACTER_CLASSES = ("ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК")
+CLASS_SHEET_SECTIONS = {
+    "ВАР": "ВАРЫ",
+    "МАГ": "МАГИ",
+    "ДРУ": "ДРУЛИ",
+    "ТАНК": "ТАНКИ",
+    "ЛУК": "ЛУЧНИКИ",
+    "ПРИСТ": "ПРИСТЫ",
+}
+
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -38,6 +49,9 @@ OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 # =============================================
 
 logging.basicConfig(level=logging.INFO)
+# Telegram API URLs contain the bot token; do not log routine HTTP requests.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ---------- БАЗА ДАННЫХ ----------
 def init_db():
@@ -597,19 +611,8 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not users:
         await update.message.reply_text("Нет зарегистрированных пользователей.")
         return
-    class_mapping = {
-        "ВАР": "ВАРЫ",
-        "МАГ": "МАГИ",
-        "ДРУ": "ДРУЛИ",
-        "ТАНК": "ТАНКИ",
-        "ЛУК": "ЛУЧНИКИ",
-        "ПРИСТ": "ПРИСТЫ",
-        "СИН": "СИНЫ",
-        "ШАМ": "ШАМЫ",
-        "СИК": "СТРАЖИ",
-        "МИСТИК": "МИСТИКИ"
-    }
-    section_order = ["ВАРЫ", "МАГИ", "ДРУЛИ", "ТАНКИ", "ЛУЧНИКИ", "ПРИСТЫ", "СИНЫ", "ШАМЫ", "СТРАЖИ", "МИСТИКИ"]
+    class_mapping = CLASS_SHEET_SECTIONS
+    section_order = list(CLASS_SHEET_SECTIONS.values())
     grouped = {section: [] for section in section_order}
     for uid, nick, user_class, _ in users:
         section = class_mapping.get(user_class.upper())
@@ -671,19 +674,8 @@ def sync_pa_internal():
     users = get_all_users()
     if not users:
         return
-    class_mapping = {
-        "ВАР": "ВАРЫ",
-        "МАГ": "МАГИ",
-        "ДРУ": "ДРУЛИ",
-        "ТАНК": "ТАНКИ",
-        "ЛУК": "ЛУЧНИКИ",
-        "ПРИСТ": "ПРИСТЫ",
-        "СИН": "СИНЫ",
-        "ШАМ": "ШАМЫ",
-        "СИК": "СТРАЖИ",
-        "МИСТИК": "МИСТИКИ"
-    }
-    section_order = ["ВАРЫ", "МАГИ", "ДРУЛИ", "ТАНКИ", "ЛУЧНИКИ", "ПРИСТЫ", "СИНЫ", "ШАМЫ", "СТРАЖИ", "МИСТИКИ"]
+    class_mapping = CLASS_SHEET_SECTIONS
+    section_order = list(CLASS_SHEET_SECTIONS.values())
     grouped = {section: [] for section in section_order}
     for uid, nick, user_class, _ in users:
         section = class_mapping.get(user_class.upper())
@@ -1000,7 +992,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data['edit_class_nick'] = target_nick
         context.user_data['edit_class_user_id'] = target_user_id
-        classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+        classes = CHARACTER_CLASSES
         keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
         keyboard.append([KeyboardButton("❌ Отмена")])
         await update.message.reply_text(
@@ -1010,7 +1002,7 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     new_class = text.upper()
-    valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+    valid_classes = CHARACTER_CLASSES
     if new_class not in valid_classes:
         await update.message.reply_text("Неверный класс. Выберите из кнопок или нажмите «❌ Отмена».")
         return
@@ -1398,7 +1390,7 @@ async def admin_poll_for_other(update: Update, context: ContextTypes.DEFAULT_TYP
         "`НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 \\ ОТВЕТ_3 ...`\n\n"
         f"Количество ответов должно быть равно количеству встреч в опросе ({len(poll['meetings'])}):\n"
         f"{', '.join(poll['meetings'])}\n\n"
-        "Пример: `Qudas \\ СИН \\ Буду \\ Не буду \\ Не знаю`\n\n"
+        "Пример: `Qudas \\ ВАР \\ Буду \\ Не буду \\ Не знаю`\n\n"
         "Для отмены нажмите «❌ Отмена».",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -1419,7 +1411,13 @@ async def handle_admin_poll_text(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ Неверный формат. Ожидается: НИК \\ КЛАСС \\ ОТВЕТ_1 \\ ОТВЕТ_2 ...")
         return
     nick = parts[0]
-    user_class = parts[1]
+    user_class = parts[1].upper()
+    if user_class not in CHARACTER_CLASSES:
+        await update.message.reply_text(
+            "❌ Неверный класс для PW 1.3.6. Допустимые классы: "
+            + ", ".join(CHARACTER_CLASSES)
+        )
+        return
     answers = parts[2:]
     poll_data = context.user_data.get('admin_poll_data')
     if not poll_data:
@@ -1624,7 +1622,7 @@ async def edit_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Выберите, что хотите исправить:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
 def get_class_keyboard():
-    classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+    classes = CHARACTER_CLASSES
     keyboard = [[KeyboardButton(cls) for cls in classes[i:i+3]] for i in range(0, len(classes), 3)]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
 
@@ -1767,7 +1765,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Регистрация: класс
     if context.user_data.get('awaiting_class'):
-        valid_classes = ["ВАР", "МАГ", "ТАНК", "ДРУ", "ПРИСТ", "ЛУК", "СИН", "ШАМ", "СИК", "МИСТИК"]
+        valid_classes = CHARACTER_CLASSES
         if text in valid_classes:
             nick = context.user_data.pop('temp_nick')
             user_class = text
