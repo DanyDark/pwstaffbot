@@ -196,8 +196,27 @@ def _ensure_month(spreadsheet, year, month):
     return ws
 
 
+def player_input_columns(spec):
+    columns = {c for cols in spec['events'].values() for c in cols}
+    return columns | {spec['headers'][name] for name in ('ПРИМЕЧАНИЕ', 'КАПИТАНСКИЕ')
+                      if name in spec['headers']}
+
+
+def free_player_row(rows, spec, start, stop):
+    inputs = player_input_columns(spec)
+    note = spec['headers'].get('ПРИМЕЧАНИЕ')
+    if note:
+        inputs.discard(note)
+    return next((r for r in range(start + 1, stop)
+                 if not str(cell(rows[r - 1], spec['nick'])).strip()
+                 and label(cell(rows[r - 1], 2)) not in ('ИТОГО', 'ИТОГ', 'ВСЕГО')
+                 and (not note or label(cell(rows[r - 1], note)) in ('', 'ОСНОВА'))
+                 and all(not str(cell(rows[r - 1], c)).strip() for c in inputs)
+                 and any(str(v).startswith('=') for v in rows[r - 1])), None)
+
+
 def sync_players(ws, users):
-    rows = ws.get_all_values()
+    rows = ws.get_all_values(value_render_option='FORMULA')
     spec = layout(rows)
     existing = {nick.casefold() for _, nick in players(rows, spec)}
     sections = [(i, class_of_row(row)) for i, row in enumerate(rows, 1) if i > spec['header'] and class_of_row(row)]
@@ -209,11 +228,7 @@ def sync_players(ws, users):
         if start is None:
             raise ValueError(f'В листе нет раздела класса {cls}.')
         stop = next((r for r, _ in sections if r > start), len(rows) + 1)
-        free = next((r for r in range(start + 1, stop)
-                     if not str(cell(rows[r - 1], spec['nick'])).strip()
-                     and label(cell(rows[r - 1], 2)) not in ('ИТОГО', 'ИТОГ', 'ВСЕГО')
-                     and any(str(v).strip() for j, v in enumerate(rows[r - 1], 1)
-                             if j not in (2, 3))), None)
+        free = free_player_row(rows, spec, start, stop)
         if free is None:
             raise ValueError(f'Нет свободной строки в разделе {cls}; добавьте строку с формулами.')
         updates.append({'range': a1(spec['nick'], free), 'values': [[nick]]})
@@ -229,3 +244,65 @@ def sync_players(ws, users):
 def moscow_month():
     now = datetime.now(ZoneInfo('Europe/Moscow'))
     return now.year, now.month
+
+
+def player_stats(ws, nick):
+    rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
+    spec = layout(rows)
+    matches = [r for r, name in players(rows, spec) if name.casefold() == nick.casefold()]
+    if not matches:
+        raise ValueError('Ваш ник не найден в месячном листе. Попросите администратора выполнить /sync_pa.')
+    if len(matches) != 1:
+        raise ValueError(f'Ник {nick} повторяется в строках {", ".join(map(str,matches))}. '
+                         'Попросите администратора убрать дубликат.')
+    row = rows[matches[0] - 1]
+    events = {}
+    for event, columns in spec['events'].items():
+        marks = [str(cell(row, col)).strip() for col in columns]
+        events[event] = {'visits':sum(v in ('1','2','1.0','2.0') for v in marks),
+                         'leader':sum(v in ('2','2.0') for v in marks),
+                         'points':sum(int(float(v)) for v in marks if v in ('1','2','1.0','2.0'))}
+    values = {name:cell(row,col) for name,col in spec['headers'].items()}
+    return {'sheet':ws.title,'nick':nick,'events':events,'values':values}
+
+
+def edit_player(ws, old_nick, new_nick, character_class):
+    """Move only input cells; keep each row's existing formula cells intact."""
+    rows = ws.get_all_values(value_render_option='FORMULA')
+    spec = layout(rows)
+    matches = [r for r,n in players(rows,spec) if n.casefold() == old_nick.casefold()]
+    if len(matches) > 1:
+        raise ValueError('Старый ник встречается в таблице несколько раз.')
+    if not matches:
+        return False
+    source = matches[0]
+    if any(n.casefold() == new_nick.casefold() and r != source for r,n in players(rows,spec)):
+        raise ValueError('Новый ник уже есть в таблице.')
+    sections = [(r,class_of_row(row)) for r,row in enumerate(rows,1) if r > spec['header'] and class_of_row(row)]
+    current_class = next((c for r,c in reversed(sections) if r < source),None)
+    target = source
+    if current_class != character_class:
+        start = next((r for r,c in sections if c == character_class),None)
+        if start is None:
+            raise ValueError(f'Нет раздела класса {character_class}.')
+        stop = next((r for r,_ in sections if r > start),len(rows)+1)
+        target = free_player_row(rows, spec, start, stop)
+        if target is None:
+            raise ValueError(f'Нет свободной строки с формулами для класса {character_class}.')
+    updates = [{'range':a1(spec['nick'],target),'values':[[new_nick]]}]
+    if source != target:
+        columns = player_input_columns(spec)
+        for col in columns:
+            original = cell(rows[source-1],col)
+            destination = cell(rows[target-1],col)
+            if str(original).startswith('=') or str(destination).startswith('='):
+                raise ValueError('В переносимых ячейках есть формула. Перенесите строку вручную.')
+            default_note = col == spec['headers'].get('ПРИМЕЧАНИЕ') and label(destination) == 'ОСНОВА'
+            if str(destination).strip() and not default_note:
+                raise ValueError('Свободная строка содержит отметки или примечания. Очистите её вручную.')
+            if str(original).strip() or str(destination).strip():
+                updates.extend([{'range':a1(col,target),'values':[[original]]},
+                                {'range':a1(col,source),'values':[['']]}])
+        updates.append({'range':a1(spec['nick'],source),'values':[['']]})
+    ws.batch_update(updates,value_input_option='RAW')
+    return True

@@ -149,6 +149,55 @@ class SheetLayoutTests(unittest.TestCase):
             a.sync_players(ws, [(1,'NewMage','МАГ')])
         self.assertEqual(ws.updates, [])
 
+    def test_new_registration_cannot_inherit_marks_from_blank_nickname_row(self):
+        ws = Worksheet()
+        ws.rows[6][6] = '2'
+        with self.assertRaises(ValueError):
+            a.sync_players(ws, [(1,'NewMage','МАГ')])
+        self.assertEqual(ws.updates, [])
+
+    def test_default_osnova_note_does_not_block_registration(self):
+        ws = Worksheet()
+        ws.rows[6][3] = 'ОСНОВА'
+        self.assertEqual(a.sync_players(ws, [(1,'NewMage','МАГ')]), 1)
+        self.assertEqual(ws.rows[6][3], 'ОСНОВА')
+
+    def test_class_change_replaces_default_note_with_players_note(self):
+        ws = Worksheet()
+        ws.rows[4][3] = 'ТВИН'
+        ws.rows[9][3] = 'ОСНОВА'
+        self.assertTrue(a.edit_player(ws,'Leader','Leader','ВАР'))
+        self.assertEqual(ws.rows[9][3], 'ТВИН')
+        self.assertEqual(ws.rows[4][3], '')
+
+    def test_rename_keeps_attendance_and_formulas_in_same_row(self):
+        ws=Worksheet()
+        ws.rows[4][6]='2'
+        before=ws.rows[4][35:37]
+        self.assertTrue(a.edit_player(ws,'Leader','NewName','МАГ'))
+        self.assertEqual(ws.rows[4][2],'NewName')
+        self.assertEqual(ws.rows[4][6],'2')
+        self.assertEqual(ws.rows[4][35:37],before)
+
+    def test_class_change_moves_inputs_without_overwriting_salary_formulas(self):
+        ws=Worksheet()
+        ws.rows[4][6]='2'
+        ws.rows[4][37]='50000'
+        self.assertTrue(a.edit_player(ws,'Leader','Leader','ВАР'))
+        self.assertEqual(ws.rows[9][2],'Leader')
+        self.assertEqual(ws.rows[9][6],'2')
+        self.assertEqual(ws.rows[9][37],'50000')
+        self.assertEqual(ws.rows[4][2],'')
+        self.assertEqual(ws.rows[4][6],'')
+        self.assertEqual(ws.rows[9][4],'=AH10/$AH$1')
+
+    def test_class_change_refuses_destination_with_existing_attendance(self):
+        ws=Worksheet()
+        ws.rows[9][6]='1'
+        with self.assertRaises(ValueError):
+            a.edit_player(ws,'Leader','Leader','ВАР')
+        self.assertEqual(ws.updates,[])
+
     def test_month_creation_preserves_template_and_is_idempotent(self):
         book = Spreadsheet()
         original = copy.deepcopy(book.worksheet('Новый шаблон').rows)

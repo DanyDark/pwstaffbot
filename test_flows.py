@@ -7,6 +7,9 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import json
+from datetime import datetime, time
+from decimal import Decimal, InvalidOperation
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +31,9 @@ def load_functions():
             nodes.append(node)
     namespace = dict(sqlite3=sqlite3, os=os, logging=logging, closing=closing,
                      asyncio=asyncio, attendance=attendance,
+                     Decimal=Decimal, InvalidOperation=InvalidOperation, json=json, datetime=datetime, time=time,
+                     InlineKeyboardButton=lambda text,callback_data: SimpleNamespace(text=text,callback_data=callback_data),
+                     InlineKeyboardMarkup=lambda rows: SimpleNamespace(inline_keyboard=rows),
                      KeyboardButton=lambda text: text,
                      ReplyKeyboardMarkup=lambda rows, **kwargs: rows)
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), 'bot.py', 'exec'), namespace)
@@ -233,7 +239,7 @@ class BotFlows(unittest.IsolatedAsyncioTestCase):
         ws = Worksheet()
         self.ns['get_current_activity_sheet'] = lambda: ws
         _, values = self.ns['salary_summary']('Leader')
-        self.assertEqual(values,['Leader: 1/2 — 100000; 2/2 — 200000'])
+        self.assertEqual(values,['Leader (стр. 5): 1/2 — 100 000; 2/2 — 200 000'])
         self.assertEqual(ws.updates,[])
 
 
