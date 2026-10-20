@@ -1,5 +1,6 @@
 """Offline regression tests: no Telegram requests or production database access."""
 import ast
+import base64
 import asyncio
 import logging
 import os
@@ -9,7 +10,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 
 def load_functions():
@@ -134,6 +135,24 @@ class BotFlows(unittest.IsolatedAsyncioTestCase):
             message=SimpleNamespace(reply_text=AsyncMock())
         )
         await self.ns['gvg_callback'](self.update, self.context)
+
+    async def test_ocr_missing_key_is_explained(self):
+        self.ns['OCR_SPACE_API_KEY'] = ''
+        with self.assertRaisesRegex(ValueError, 'OCR_SPACE_API_KEY'):
+            self.ns['extract_nicks_from_image'](b'image')
+
+    async def test_ocr_labels_jpeg_correctly_and_parses_all_results(self):
+        response = Mock()
+        response.json.return_value = {'ParsedResults': [
+            {'ParsedText': 'PlayerOne\n123'}, {'ParsedText': 'PlayerTwo'}
+        ]}
+        post = Mock(return_value=response)
+        self.ns.update(OCR_SPACE_API_KEY='test-key', base64=base64,
+                       requests=SimpleNamespace(post=post))
+        result = self.ns['extract_nicks_from_image'](bytes.fromhex('ffd8ff') + b'image')
+        self.assertEqual(result, ['PlayerOne', 'PlayerTwo'])
+        self.assertTrue(post.call_args.kwargs['data']['base64Image'].startswith('data:image/jpeg;'))
+        response.raise_for_status.assert_called_once()
 
 
 if __name__ == '__main__':

@@ -384,23 +384,23 @@ def get_non_responders(poll_id):
 # ---------- OCR.space ----------
 def extract_nicks_from_image(image_bytes):
     if not OCR_SPACE_API_KEY:
-        logging.error("OCR_SPACE_API_KEY не задан")
-        return []
+        raise ValueError("На Bothost не задан OCR_SPACE_API_KEY. Добавьте ключ OCR.space в переменные окружения.")
     try:
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
         payload = {
             'apikey': OCR_SPACE_API_KEY,
             'language': 'rus',
             'isOverlayRequired': False,
-            'base64Image': f'data:image/png;base64,{image_base64}',
+            'base64Image': f'data:image/{"jpeg" if image_bytes.startswith(bytes.fromhex("ffd8ff")) else "png"};base64,{image_base64}',
             'OCREngine': 2,
         }
         response = requests.post('https://api.ocr.space/parse/image', data=payload, timeout=30)
+        response.raise_for_status()
         result = response.json()
         if result.get('IsErroredOnProcessing'):
             logging.error(f"OCR.space ошибка: {result.get('ErrorMessage')}")
             return []
-        parsed_text = result.get('ParsedResults', [{}])[0].get('ParsedText', '')
+        parsed_text = '\n'.join(item.get('ParsedText', '') for item in (result.get('ParsedResults') or []))
         lines = [line.strip() for line in parsed_text.splitlines() if line.strip()]
         nicks = []
         for line in lines:
@@ -1119,7 +1119,11 @@ async def handle_activity_photo(update: Update, context: ContextTypes.DEFAULT_TY
     photo_file = await update.message.photo[-1].get_file()
     image_bytes = await photo_file.download_as_bytearray()
     await update.message.reply_text("🔍 Распознаю ники на изображении...")
-    raw_nicks = extract_nicks_from_image(bytes(image_bytes))
+    try:
+        raw_nicks = await asyncio.to_thread(extract_nicks_from_image, bytes(image_bytes))
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
     if not raw_nicks:
         await update.message.reply_text("Не удалось распознать ни одного ника.")
         return
@@ -1185,8 +1189,8 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop('activity_step', None)
         return
     try:
-        ws = get_current_activity_sheet()
-        updated = mark_activity_in_sheet_with_pl(ws, activity, nicks, threshold=70)
+        ws = await asyncio.to_thread(get_current_activity_sheet)
+        updated = await asyncio.to_thread(mark_activity_in_sheet_with_pl, ws, activity, nicks, threshold=70)
         nick_col = find_column_by_header(ws, "НИК")
         all_nicks_in_sheet = []
         if nick_col:
