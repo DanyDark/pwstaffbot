@@ -177,9 +177,13 @@ def get_user_id_by_nick(nick):
     return matches[0] if len(matches) == 1 else None
 
 
-def is_nick_taken(nick):
+def is_nick_taken(nick, user_class=None, exclude_user_id=None):
     key = nicknames.canonical(nick).casefold()
-    return any(nicknames.canonical(value).casefold() == key for _,value,*_ in get_all_users()+get_pending_users())
+    return any(uid != exclude_user_id and
+               (nicknames.canonical(value).casefold() == key or
+                (user_class is not None and cls == user_class and
+                 nicknames.visual_key(value) == nicknames.visual_key(nick)))
+               for uid, value, cls, *_ in get_all_users() + get_pending_users())
 
 
 def valid_nick(nick):
@@ -237,6 +241,10 @@ def approve_admin_registration(user_id):
     if not is_admin(user_id):
         return
     with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        pending = conn.execute('SELECT nick, class FROM pending_users WHERE user_id=?', (user_id,)).fetchone()
+        if pending and is_nick_taken(*pending, exclude_user_id=user_id):
+            logging.error('Регистрация администратора %s не подтверждена: ник занят', user_id)
+            return
         conn.execute(
             "INSERT OR IGNORE INTO users (user_id, nick, class) "
             "SELECT user_id, nick, class FROM pending_users WHERE user_id = ?",
@@ -270,6 +278,7 @@ def get_pending_users():
     return rows
 
 def confirm_all_pending():
+    nicknames.ensure_unique_profiles(get_all_users() + get_pending_users())
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, nick, class FROM pending_users")
@@ -627,6 +636,7 @@ async def refresh_activity_month():
 def reconcile_sheet_profiles(ws, users):
     all_users = get_all_users()
     pending = get_pending_users()
+    nicknames.ensure_unique_profiles(all_users + pending)
     for old, correct in nicknames.CONFIRMED_ALIASES.items():
         owners = {uid for uid, name, *_ in all_users + pending
                   if nicknames.canonical(name).casefold() == correct.casefold()}
@@ -643,10 +653,18 @@ def reconcile_sheet_profiles(ws, users):
     for uid,nick,cls,*_ in users:
         source=nick
         if nick.casefold() not in known:
+            similar = [name for row, name in attendance.players(rows)
+                       if attendance.player_class(rows, row) == cls
+                       and nicknames.visual_key(name) == nicknames.visual_key(nick)]
+            if len(similar) > 1:
+                raise ValueError(f'В классе {cls} несколько строк ника {nick} с похожими буквами. Устраните дубликат.')
+            if any(owners.get(name.casefold(), uid) != uid for name in similar):
+                raise ValueError(f'Похожая строка ника {nick} принадлежит другому профилю. Проверьте класс и ник.')
             with closing(sqlite3.connect(DB_FILE)) as conn:
                 aliases=conn.execute('SELECT old_nick FROM nick_aliases WHERE user_id=?',(uid,)).fetchall()
             candidates=[old for old, in aliases if old.casefold() in known
                         and owners.get(old.casefold(),uid)==uid]
+            candidates += similar
             if len({old.casefold() for old in candidates})>1:
                 raise ValueError(f'В таблице несколько прежних ников игрока {nick}. Проверьте строки вручную.')
             source=next(iter(candidates),nick)
@@ -944,6 +962,10 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('Неверный класс. Выберите класс кнопкой или нажмите «❌ Отменить редактирование».')
         return
     target_user_id = context.user_data['edit_class_user_id']
+    if is_nick_taken(get_user_nick(target_user_id), new_class, exclude_user_id=target_user_id):
+        await update.message.reply_text('❌ В этом классе уже есть игрок с таким ником или с заменой '
+                                        'русских и английских букв. Проверьте профиль перед сменой класса.')
+        return
     try:
         nick=get_user_nick(target_user_id)
         await asyncio.to_thread(update_sheet_profile,target_user_id,nick,nick,new_class)
@@ -990,10 +1012,11 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not valid_nick(new_nick):
         await update.message.reply_text('Ник должен содержать от 1 до 32 символов и не совпадать с названиями классов или кнопок.')
         return
-    if is_nick_taken(new_nick) and new_nick.casefold()!=nicknames.canonical(context.user_data['edit_old_nick']).casefold():
-        await update.message.reply_text("❌ Этот ник уже занят другим пользователем. Введите другой.")
-        return
     target_user_id = context.user_data['edit_target_user_id']
+    if is_nick_taken(new_nick, get_user_class(target_user_id), exclude_user_id=target_user_id):
+        await update.message.reply_text('❌ Этот ник уже занят другим пользователем, в том числе '
+                                        'с заменой русских и английских букв в том же классе. Введите другой.')
+        return
     old_nick=get_user_nick(target_user_id)
     try:
         await asyncio.to_thread(update_sheet_profile,target_user_id,old_nick,new_nick,get_user_class(target_user_id))
@@ -1293,7 +1316,11 @@ async def confirm_all_pending_command(update: Update, context: ContextTypes.DEFA
     if not is_admin(user_id):
         await update.message.reply_text("Доступно только администратору.")
         return
-    confirmed = confirm_all_pending()
+    try:
+        confirmed = confirm_all_pending()
+    except ValueError as exc:
+        await update.message.reply_text(f'❌ Заявки не подтверждены: {exc}')
+        return
     count = len(confirmed)
     if not count:
         await update.message.reply_text('Нет заявок для подтверждения.')
@@ -1855,10 +1882,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         valid_classes = CHARACTER_CLASSES
         if text.upper() in valid_classes:
             nick = context.user_data['temp_nick']
-            if is_nick_taken(nick):
+            if is_nick_taken(nick, text.upper()):
                 clear_input_state(context)
                 context.user_data['awaiting_nick']=True
-                await update.message.reply_text('Этот ник уже занят или ожидает подтверждения. Введите другой ник.',
+                await update.message.reply_text('Этот ник уже занят или ожидает подтверждения, в том числе '
+                                                'с заменой русских и английских букв в том же классе. '
+                                                'Если это ваш профиль, обратитесь к администратору. Введите другой ник.',
                                                 reply_markup=form_keyboard(cancel='❌ Отменить регистрацию'))
                 return
             context.user_data.pop('temp_nick')

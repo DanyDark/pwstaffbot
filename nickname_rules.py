@@ -1,8 +1,26 @@
-"""Explicit, owner-confirmed spelling corrections; never guess from similarity."""
+"""Nickname spelling rules; visual comparisons always require the same class."""
 import logging
 
 # Confirmed by the clan administrator on 2026-10-24: second letter is Cyrillic а.
 CONFIRMED_ALIASES = {'macintosh': 'Mаcintosh'}
+
+# Cyrillic/Latin lookalikes, not phonetic transliteration or OCR guesses.
+LOOKALIKES = str.maketrans(dict(zip('авекмнорстух', 'abekmhopctyx')))
+
+
+def visual_key(nick):
+    """Comparison only: never use this value as a player's displayed nickname."""
+    return canonical(nick).casefold().translate(LOOKALIKES)
+
+
+def ensure_unique_profiles(profiles):
+    owners = {}
+    for uid, nick, cls, *_ in profiles:
+        key = (cls, visual_key(nick))
+        if key in owners and owners[key] != uid:
+            raise ValueError(f'У ника {nick} ({cls}) несколько Telegram-профилей с похожими '
+                             'русскими и английскими буквами. Проверьте владельца.')
+        owners[key] = uid
 
 
 def canonical(nick):

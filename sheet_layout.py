@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 import calendar
 import re
 from threading import RLock
+import nickname_rules as nicknames
 
 MONTH_LOCK = RLock()
 
@@ -39,6 +40,11 @@ def class_of_row(row):
         if value in CLASS_ALIASES:
             return CLASS_ALIASES[value]
     return None
+
+
+def player_class(rows, row_number):
+    return next((cls for row in reversed(rows[:row_number - 1])
+                 if (cls := class_of_row(row))), None)
 
 
 def layout(rows):
@@ -278,13 +284,30 @@ def free_player_row(rows, spec, start, stop):
 
 
 def sync_players(ws, users):
+    users = list(users)
+    nicknames.ensure_unique_profiles(users)
     rows = ws.get_all_values(value_render_option='FORMULA')
     spec = layout(rows)
     existing = {nick.casefold() for _, nick in players(rows, spec)}
     sections = [(i, class_of_row(row)) for i, row in enumerate(rows, 1) if i > spec['header'] and class_of_row(row)]
     updates = []
-    for _, nick, cls, *_ in users:
+    added = 0
+    owners = {nicknames.canonical(name).casefold(): uid for uid, name, *_ in users}
+    for uid, nick, cls, *_ in users:
+        similar = [(r, name) for r, name in players(rows, spec)
+                   if player_class(rows, r) == cls and nicknames.visual_key(name) == nicknames.visual_key(nick)]
+        if len(similar) > 1:
+            raise ValueError(f'В классе {cls} несколько строк ника {nick} с похожими буквами. Устраните дубликат.')
+        if any(owners.get(nicknames.canonical(name).casefold(), uid) != uid for _, name in similar):
+            raise ValueError(f'Похожая строка ника {nick} принадлежит другому профилю. Проверьте класс и ник.')
         if nick.casefold() in existing:
+            continue
+        if similar:
+            row, previous = similar[0]
+            updates.append({'range': a1(spec['nick'], row), 'values': [[nick]]})
+            rows[row - 1][spec['nick'] - 1] = nick
+            existing.discard(previous.casefold())
+            existing.add(nick.casefold())
             continue
         start = next((r for r, c in sections if c == cls), None)
         if start is None:
@@ -294,13 +317,14 @@ def sync_players(ws, users):
         if free is None:
             raise ValueError(f'Нет свободной строки в разделе {cls}; добавьте строку с формулами.')
         updates.append({'range': a1(spec['nick'], free), 'values': [[nick]]})
+        added += 1
         while len(rows[free - 1]) < spec['nick']:
             rows[free - 1].append('')
         rows[free - 1][spec['nick'] - 1] = nick
         existing.add(nick.casefold())
     if updates:
         ws.batch_update(updates, value_input_option='RAW')
-    return len(updates)
+    return added
 
 
 def moscow_month():
@@ -395,7 +419,11 @@ def edit_player(ws, old_nick, new_nick, character_class):
     if not matches:
         return False
     source = matches[0]
-    if any(n.casefold() == new_nick.casefold() and r != source for r,n in players(rows,spec)):
+    if any(r != source and
+           (n.casefold() == new_nick.casefold() or
+            (player_class(rows, r) == character_class and
+             nicknames.visual_key(n) == nicknames.visual_key(new_nick)))
+           for r, n in players(rows, spec)):
         raise ValueError('Новый ник уже есть в таблице.')
     sections = [(r,class_of_row(row)) for r,row in enumerate(rows,1) if r > spec['header'] and class_of_row(row)]
     current_class = next((c for r,c in reversed(sections) if r < source),None)
