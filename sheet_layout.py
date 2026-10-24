@@ -332,6 +332,59 @@ def player_stats(ws, nick):
     return {'sheet':ws.title,'nick':nick,'events':events,'values':values}
 
 
+def merge_confirmed_player(ws, old_nick, correct_nick):
+    """Merge only a spelling pair whose shared identity was explicitly confirmed."""
+    rows = ws.get_all_values(value_render_option='FORMULA')
+    spec = layout(rows)
+    old = [r for r, n in players(rows, spec) if n.casefold() == old_nick.casefold()]
+    correct = [r for r, n in players(rows, spec) if n.casefold() == correct_nick.casefold()]
+    if not old:
+        return 0
+    if len(old) != 1 or len(correct) > 1:
+        raise ValueError('Подтверждённый ник повторяется в нескольких строках; объединение отменено.')
+    source = old[0]
+    if not correct:
+        ws.batch_update([{'range': a1(spec['nick'], source), 'values': [[correct_nick]]}], value_input_option='RAW')
+        return 1
+    target = correct[0]
+    if source == target:
+        return 0
+    sections = [(r, class_of_row(row)) for r, row in enumerate(rows, 1) if class_of_row(row)]
+    class_at = lambda row: next((cls for r, cls in reversed(sections) if r < row), None)
+    if not class_at(source) or class_at(source) != class_at(target):
+        raise ValueError('Две строки находятся в разных разделах классов; проверьте класс перед объединением.')
+    updates = []
+    event_cols = {c for cols in spec['events'].values() for c in cols}
+    for col in sorted(player_input_columns(spec)):
+        src, dst = cell(rows[source - 1], col), cell(rows[target - 1], col)
+        if str(src).startswith('=') or str(dst).startswith('='):
+            raise ValueError('В объединяемых входных ячейках есть формула; объединение отменено.')
+        left, right = str(src).strip(), str(dst).strip()
+        if col in event_cols:
+            allowed = ('', '0', '1', '2', '0.0', '1.0', '2.0')
+            if left not in allowed or right not in allowed:
+                raise ValueError('В объединяемых строках нестандартные отметки; объединение отменено.')
+            value = max(int(float(left or 0)), int(float(right or 0)))
+            if value > int(float(right or 0)):
+                updates.append({'range': a1(col, target), 'values': [[value]]})
+        elif col == spec['headers'].get('ПРИМЕЧАНИЕ'):
+            if left and label(left) != 'ОСНОВА':
+                if right and label(right) != 'ОСНОВА' and left != right:
+                    raise ValueError('Примечания различаются; объединение отменено.')
+                if left != right:
+                    updates.append({'range': a1(col, target), 'values': [[src]]})
+        elif left and left != '0':
+            if right and right != '0' and left != right:
+                raise ValueError('Капитанские различаются; объединение отменено.')
+            if left != right:
+                updates.append({'range': a1(col, target), 'values': [[src]]})
+        if left:
+            updates.append({'range': a1(col, source), 'values': [['']]})
+    updates.append({'range': a1(spec['nick'], source), 'values': [['']]})
+    ws.batch_update(updates, value_input_option='RAW')
+    return 1
+
+
 def edit_player(ws, old_nick, new_nick, character_class):
     """Move only input cells; keep each row's existing formula cells intact."""
     rows = ws.get_all_values(value_render_option='FORMULA')

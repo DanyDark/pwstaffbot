@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 import sheet_layout as attendance
 import bot_ui as ui
+import nickname_rules as nicknames
 from test_sheet_layout import Worksheet
 
 
@@ -31,7 +32,7 @@ def load_functions():
         ):
             nodes.append(node)
     namespace = dict(sqlite3=sqlite3, os=os, logging=logging, closing=closing,
-                     asyncio=asyncio, attendance=attendance, ui=ui,
+                     asyncio=asyncio, attendance=attendance, ui=ui, nicknames=nicknames,
                      Decimal=Decimal, InvalidOperation=InvalidOperation, json=json, datetime=datetime, time=time, timedelta=timedelta,
                      InlineKeyboardButton=lambda text,callback_data=None,url=None: SimpleNamespace(text=text,callback_data=callback_data,url=url),
                      InlineKeyboardMarkup=lambda rows: SimpleNamespace(inline_keyboard=rows),

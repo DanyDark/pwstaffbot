@@ -8,6 +8,7 @@ import base64
 import asyncio
 import sheet_layout as attendance
 import bot_ui as ui
+import nickname_rules as nicknames
 from contextlib import closing
 from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -141,6 +142,7 @@ def init_db():
         )
     ''')
     cursor.execute("CREATE TABLE IF NOT EXISTS nick_aliases (user_id INTEGER, old_nick TEXT, PRIMARY KEY(user_id, old_nick))")
+    nicknames.apply_database_corrections(conn)
     conn.commit()
     conn.close()
 
@@ -170,15 +172,14 @@ def get_user_class(user_id):
     return row[0] if row else None
 
 def get_user_id_by_nick(nick):
-    for uid, value, *_ in get_all_users():
-        if value.casefold() == nick.strip().casefold():
-            return uid
-    return None
+    key = nicknames.canonical(nick).casefold()
+    matches = [uid for uid, value, *_ in get_all_users() if nicknames.canonical(value).casefold() == key]
+    return matches[0] if len(matches) == 1 else None
 
 
 def is_nick_taken(nick):
-    key = nick.strip().casefold()
-    return any(value.casefold() == key for _,value,*_ in get_all_users()+get_pending_users())
+    key = nicknames.canonical(nick).casefold()
+    return any(nicknames.canonical(value).casefold() == key for _,value,*_ in get_all_users()+get_pending_users())
 
 
 def valid_nick(nick):
@@ -210,6 +211,7 @@ def delete_user(user_id):
     conn.close()
 
 def register_user(user_id, nick, user_class):
+    nick = nicknames.canonical(nick)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("INSERT INTO users (user_id, nick, class) VALUES (?, ?, ?)", (user_id, nick, user_class))
@@ -249,6 +251,7 @@ def approve_admin_registration(user_id):
 
 # ---------- ЗАЯВКИ НА РЕГИСТРАЦИЮ ----------
 def add_pending_user(user_id, nick, user_class):
+    nick = nicknames.canonical(nick)
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -622,11 +625,19 @@ async def refresh_activity_month():
 
 
 def reconcile_sheet_profiles(ws, users):
+    all_users = get_all_users()
+    pending = get_pending_users()
+    for old, correct in nicknames.CONFIRMED_ALIASES.items():
+        owners = {uid for uid, name, *_ in all_users + pending
+                  if nicknames.canonical(name).casefold() == correct.casefold()}
+        if len(owners) > 1:
+            raise ValueError(f'У ника {correct} несколько Telegram-профилей. Проверьте владельца перед синхронизацией.')
+        attendance.merge_confirmed_player(ws, old, correct)
     rows=ws.get_all_values()
     known={}
     for row,name in attendance.players(rows):
         known.setdefault(name.casefold(),[]).append(row)
-    owners={nick.casefold():uid for uid,nick,*_ in get_all_users()}
+    owners={nick.casefold():uid for uid,nick,*_ in all_users}
     sections=[(i,attendance.class_of_row(row)) for i,row in enumerate(rows,1)
               if attendance.class_of_row(row)]
     for uid,nick,cls,*_ in users:
@@ -975,11 +986,11 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'Состав клана → {old_nick} → Изменить ник\n'
                                         'Шаг 2 из 2: введите новый ник. После ввода профиль будет сохранён.')
         return
-    new_nick = text
+    new_nick = nicknames.canonical(text)
     if not valid_nick(new_nick):
         await update.message.reply_text('Ник должен содержать от 1 до 32 символов и не совпадать с названиями классов или кнопок.')
         return
-    if is_nick_taken(new_nick) and new_nick.casefold()!=context.user_data['edit_old_nick'].casefold():
+    if is_nick_taken(new_nick) and new_nick.casefold()!=nicknames.canonical(context.user_data['edit_old_nick']).casefold():
         await update.message.reply_text("❌ Этот ник уже занят другим пользователем. Введите другой.")
         return
     target_user_id = context.user_data['edit_target_user_id']
@@ -1074,11 +1085,11 @@ def accumulate_screenshot(state, raw, known):
     # never award attendance or leadership to a different player.
     canonical = {}
     for nick in known:
-        canonical.setdefault(nick.strip().casefold(), []).append(nick)
+        canonical.setdefault(nicknames.canonical(nick).casefold(), []).append(nick)
     recognized, unknown = [], []
     mapped = {}
     for value in raw:
-        matches = list(dict.fromkeys(canonical.get(value.strip().casefold(), [])))
+        matches = list(dict.fromkeys(canonical.get(nicknames.canonical(value).casefold(), [])))
         if len(matches) == 1:
             mapped[value] = matches[0]
             recognized.append(matches[0])
@@ -1826,7 +1837,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Регистрация: ник
     if context.user_data.get('awaiting_nick'):
-        nick = text.strip()
+        nick = nicknames.canonical(text)
         if not valid_nick(nick):
             await update.message.reply_text('Введите игровой ник от 1 до 32 символов, без переносов строк и названий разделов.')
             return
