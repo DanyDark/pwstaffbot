@@ -1104,15 +1104,19 @@ async def send_activity_report(update, text, reply_markup=None):
 
 
 def accumulate_screenshot(state, raw, known):
-    # Only exact normalized names are accepted automatically. OCR guesses must
-    # never award attendance or leadership to a different player.
+    # Exact names win. A small OCR-only fallback handles I/1/| read as l;
+    # ambiguous fallbacks remain unknown instead of guessing.
     canonical = {}
+    ocr = {}
     for nick in known:
         canonical.setdefault(nicknames.canonical(nick).casefold(), []).append(nick)
+        ocr.setdefault(nicknames.ocr_key(nick), []).append(nick)
     recognized, unknown = [], []
     mapped = {}
     for value in raw:
         matches = list(dict.fromkeys(canonical.get(nicknames.canonical(value).casefold(), [])))
+        if not matches:
+            matches = list(dict.fromkeys(ocr.get(nicknames.ocr_key(value), [])))
         if len(matches) == 1:
             mapped[value] = matches[0]
             recognized.append(matches[0])

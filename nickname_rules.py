@@ -6,11 +6,17 @@ CONFIRMED_ALIASES = {'macintosh': 'Mаcintosh'}
 
 # Cyrillic/Latin lookalikes, not phonetic transliteration or OCR guesses.
 LOOKALIKES = str.maketrans(dict(zip('авекмнорстух', 'abekmhopctyx')))
+OCR_LIKE_L = str.maketrans({'I': 'l', '1': 'l', '|': 'l'})
 
 
 def visual_key(nick):
     """Comparison only: never use this value as a player's displayed nickname."""
     return canonical(nick).casefold().translate(LOOKALIKES)
+
+
+def ocr_key(nick):
+    """Conservative OCR comparison; the original nickname is always retained."""
+    return canonical(nick).strip().translate(OCR_LIKE_L).casefold()
 
 
 def ensure_unique_profiles(profiles):
