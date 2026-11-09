@@ -141,6 +141,18 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS activity_slots (
+            year INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            half INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            sheet_name TEXT NOT NULL,
+            column_number INTEGER NOT NULL,
+            PRIMARY KEY (year, month, event, event_date)
+        )
+    ''')
     cursor.execute("CREATE TABLE IF NOT EXISTS nick_aliases (user_id INTEGER, old_nick TEXT, PRIMARY KEY(user_id, old_nick))")
     nicknames.apply_database_corrections(conn)
     conn.commit()
@@ -510,14 +522,29 @@ def get_google_spreadsheet():
 
 def get_or_create_monthly_activity_sheet(spreadsheet):
     year, month = attendance.moscow_month()
-    return attendance.ensure_month(spreadsheet, year, month, users=get_all_users())
+    return attendance.ensure_half_month(spreadsheet, year, month,
+                                        attendance.half_for_date(attendance.moscow_today().strftime('%d.%m.%Y')))
 
 
-def get_current_activity_sheet():
+def get_activity_sheets_for_month():
     spreadsheet = get_google_spreadsheet()
     if not spreadsheet:
         raise ValueError("Проверьте GOOGLE_CREDS, GOOGLE_SHEET_ID и доступ редактора к таблице.")
-    return get_or_create_monthly_activity_sheet(spreadsheet)
+    year, month = attendance.moscow_month()
+    return attendance.ensure_month_halves(spreadsheet, year, month)
+
+
+def get_activity_sheet_for_date(date_text):
+    spreadsheet = get_google_spreadsheet()
+    if not spreadsheet:
+        raise ValueError("Проверьте GOOGLE_CREDS, GOOGLE_SHEET_ID и доступ редактора к таблице.")
+    year, month = attendance.moscow_month()
+    half = attendance.half_for_date(date_text)
+    return attendance.ensure_half_month(spreadsheet, year, month, half)
+
+
+def get_current_activity_sheet():
+    return get_activity_sheet_for_date(attendance.moscow_today().strftime('%d.%m.%Y'))
 
 
 def find_column_by_header(ws, header_name):
@@ -533,7 +560,8 @@ def get_available_activities(ws):
 
 
 def get_user_activity_count(nick):
-    return sum(e['visits'] for e in attendance.player_stats(get_current_activity_sheet(),nick)['events'].values())
+    return sum(e['visits'] for ws in get_activity_sheets_for_month()
+               for e in attendance.player_stats(ws, nick)['events'].values())
 
 
 def number_text(value):
@@ -547,28 +575,68 @@ def number_text(value):
         return str(value)
 
 
+def amount_text(value):
+    """Display a salary as a plain amount, without half-month labels."""
+    if value is None:
+        return '0'
+    try:
+        amount = Decimal(str(value))
+        if amount == amount.to_integral_value():
+            return f'{amount:,.0f}'.replace(',', ' ')
+        return f'{amount:,.2f}'.replace(',', ' ').rstrip('0').rstrip('.')
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def decimal_value(value):
+    if value is None or value == '' or (isinstance(value, str) and value.startswith('#')):
+        return Decimal('0')
+    try:
+        return Decimal(str(value).replace(',', '.'))
+    except InvalidOperation:
+        return Decimal('0')
+
+
+def monthly_player_report(nick):
+    events = {}
+    salary = Decimal('0')
+    pl = Decimal('0')
+    captain = Decimal('0')
+    found = False
+    for ws in get_activity_sheets_for_month():
+        report = attendance.player_stats(ws, nick)
+        found = True
+        for name, event in report['events'].items():
+            current = events.setdefault(name, {'visits': 0, 'leader': 0, 'points': 0})
+            current['visits'] += event['visits']
+            current['leader'] += event['leader']
+            current['points'] += event['points']
+        values = report['values']
+        salary += decimal_value(values.get('ЗП', values.get('ЗП 1/2')))
+        pl += decimal_value(values.get('ПЛ'))
+        captain += decimal_value(values.get('КАПИТАНСКИЕ'))
+    if not found:
+        raise ValueError(f'Ник {nick} не найден в листах активности.')
+    return {'nick': nick, 'events': events, 'salary': salary, 'pl': pl, 'captain': captain}
+
+
 def personal_report(nick, kind):
-    report = attendance.player_stats(get_current_activity_sheet(),nick)
-    values, events = report['values'], report['events']
+    report = monthly_player_report(nick)
+    events = report['events']
     title = '💰 Моя зарплата' if kind == 'salary' else '📊 Мои посещения'
-    lines = [title, f"{report['sheet']} — {report['nick']}"]
+    year, month = attendance.moscow_month()
+    lines = [title, f"{attendance.MONTH_NAMES[month - 1]} {year} — {report['nick']}"]
     if kind == 'salary':
-        lines += [f"ЗП 1/2: {number_text(values.get('ЗП 1/2'))}",
-                  f"ЗП 2/2: {number_text(values.get('ЗП 2/2'))}",
-                  f"Капитанские: {number_text(values.get('КАПИТАНСКИЕ'))}",
-                  'Капитанские уже учитываются формулой таблицы; повторно не прибавляются.']
-        first,second=values.get('ЗП 1/2'),values.get('ЗП 2/2')
-        if isinstance(first,(int,float)) and isinstance(second,(int,float)):
-            lines.append(f'Итого за месяц: {number_text(first+second)}')
+        lines.append(f"ЗП: {amount_text(report['salary'])}")
+        if report['pl']:
+            lines.append(f"ПЛские: {amount_text(report['pl'])}")
+        if report['captain']:
+            lines.append(f"Капитанские: {amount_text(report['captain'])}")
     else:
         for name,event in events.items():
             lines.append(f"{name}: посещений {event['visits']}, из них ПЛ {event['leader']}, баллов {event['points']}")
         lines += [f"Всего посещений: {sum(e['visits'] for e in events.values())}",
                   f"Всего баллов: {sum(e['points'] for e in events.values())}"]
-        for name in ('АКТИВКА 1','АКТИВКА 2'):
-            value = values.get(name)
-            display = number_text(value * 100) + '%' if isinstance(value,(int,float)) else number_text(value)
-            lines.append(f'{name}: {display}')
     return '\n'.join(lines)
 
 
@@ -584,19 +652,26 @@ async def my_activity(update,context):
 
 
 def salary_summary(nick=None):
-    ws = get_current_activity_sheet()
-    rows = ws.get_all_values(value_render_option='UNFORMATTED_VALUE')
-    spec = attendance.layout(rows)
-    first = spec['headers'].get('ЗП 1/2')
-    second = spec['headers'].get('ЗП 2/2')
-    if not first or not second:
-        raise ValueError('В таблице нет столбцов «зп 1/2» и «зп 2/2».')
+    sheets = get_activity_sheets_for_month()
+    names = []
+    seen = set()
+    for ws in sheets:
+        for _, name in attendance.players(ws.get_all_values()):
+            if name.casefold() not in seen:
+                seen.add(name.casefold())
+                names.append(name)
     result = []
-    for row, name in attendance.players(rows, spec):
+    for name in names:
         if nick is None or nick.casefold() == name.casefold():
-            result.append(f"{name} (стр. {row}): 1/2 — {number_text(attendance.cell(rows[row - 1], first))}; "
-                          f"2/2 — {number_text(attendance.cell(rows[row - 1], second))}")
-    return ws.title, result
+            report = monthly_player_report(name)
+            parts = [f"{name}: ЗП — {amount_text(report['salary'])}"]
+            if report['pl']:
+                parts.append(f"ПЛские — {amount_text(report['pl'])}")
+            if report['captain']:
+                parts.append(f"Капитанские — {amount_text(report['captain'])}")
+            result.append('; '.join(parts))
+    year, month = attendance.moscow_month()
+    return f'Активка за {attendance.MONTH_NAMES[month - 1]} {year}', result
 
 
 async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,7 +695,12 @@ async def calculate_salaries(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def sync_pa_internal():
     with attendance.MONTH_LOCK:
-        return reconcile_sheet_profiles(get_current_activity_sheet(), get_all_users())
+        spreadsheet = get_google_spreadsheet()
+        if not spreadsheet:
+            raise ValueError("Проверьте GOOGLE_CREDS, GOOGLE_SHEET_ID и доступ редактора к таблице.")
+        year, month = attendance.moscow_month()
+        attendance.ensure_month_halves(spreadsheet, year, month)
+        return 0
 
 
 async def refresh_activity_month():
@@ -628,62 +708,21 @@ async def refresh_activity_month():
         return
     try:
         await asyncio.to_thread(sync_pa_internal)
-        logging.info('Месячный лист активности и состав проверены')
+        logging.info('Два листа половин месяца активности проверены')
     except Exception:
         logging.exception('Не удалось обновить месячный лист; проверка будет повторена автоматически')
 
 
 def reconcile_sheet_profiles(ws, users):
-    all_users = get_all_users()
-    pending = get_pending_users()
-    nicknames.ensure_unique_profiles(all_users + pending)
-    for old, correct in nicknames.CONFIRMED_ALIASES.items():
-        owners = {uid for uid, name, *_ in all_users + pending
-                  if nicknames.canonical(name).casefold() == correct.casefold()}
-        if len(owners) > 1:
-            raise ValueError(f'У ника {correct} несколько Telegram-профилей. Проверьте владельца перед синхронизацией.')
-        attendance.merge_confirmed_player(ws, old, correct)
-    rows=ws.get_all_values()
-    known={}
-    for row,name in attendance.players(rows):
-        known.setdefault(name.casefold(),[]).append(row)
-    owners={nick.casefold():uid for uid,nick,*_ in all_users}
-    sections=[(i,attendance.class_of_row(row)) for i,row in enumerate(rows,1)
-              if attendance.class_of_row(row)]
-    for uid,nick,cls,*_ in users:
-        source=nick
-        if nick.casefold() not in known:
-            similar = [name for row, name in attendance.players(rows)
-                       if attendance.player_class(rows, row) == cls
-                       and nicknames.visual_key(name) == nicknames.visual_key(nick)]
-            if len(similar) > 1:
-                raise ValueError(f'В классе {cls} несколько строк ника {nick} с похожими буквами. Устраните дубликат.')
-            if any(owners.get(name.casefold(), uid) != uid for name in similar):
-                raise ValueError(f'Похожая строка ника {nick} принадлежит другому профилю. Проверьте класс и ник.')
-            with closing(sqlite3.connect(DB_FILE)) as conn:
-                aliases=conn.execute('SELECT old_nick FROM nick_aliases WHERE user_id=?',(uid,)).fetchall()
-            candidates=[old for old, in aliases if old.casefold() in known
-                        and owners.get(old.casefold(),uid)==uid]
-            candidates += similar
-            if len({old.casefold() for old in candidates})>1:
-                raise ValueError(f'В таблице несколько прежних ников игрока {nick}. Проверьте строки вручную.')
-            source=next(iter(candidates),nick)
-        matches=known.get(source.casefold(),[])
-        if len(matches)>1:
-            raise ValueError(f'Ник {source} повторяется в строках {", ".join(map(str,matches))}. Устраните дубликат.')
-        row=next(iter(matches),None)
-        current=next((c for r,c in reversed(sections) if row and r<row),None)
-        if row and (source!=nick or current!=cls):
-            attendance.edit_player(ws,source,nick,cls)
-    return attendance.sync_players(ws,users)
+    # The roster is maintained by the administrator in «Шаблон».
+    # Monthly sheets are copies; never add, rename, or remove roster names here.
+    return 0
 
 
 def update_sheet_profile(user_id, old_nick, new_nick, new_class):
-    if not globals().get('GOOGLE_CREDS_JSON') or not globals().get('GOOGLE_SHEET_ID'):
-        return
-    ws=get_current_activity_sheet()
-    if not attendance.edit_player(ws,old_nick,new_nick,new_class):
-        attendance.sync_players(ws,[(user_id,new_nick,new_class,None)])
+    # Profile edits are intentionally kept in SQLite; the administrator updates
+    # the maintained template before the next half-month copy is created.
+    return None
 
 
 async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -692,20 +731,56 @@ async def sync_pa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         count = await asyncio.to_thread(sync_pa_internal)
-        await update.message.reply_text(f'✅ Состав в таблице обновлён. Добавлено новых игроков: {count}.')
+        await update.message.reply_text('✅ Листы первой и второй половины месяца проверены. '
+                                        'Ники берутся из листа «Шаблон».')
     except Exception as exc:
         await update.message.reply_text(f"❌ Синхронизация не выполнена: {exc}")
 
 
 async def sync_registered_profile(update, user_id):
-    if not globals().get('GOOGLE_CREDS_JSON') or not globals().get('GOOGLE_SHEET_ID'):
-        return
-    try:
-        users = [user for user in get_all_users() if user[0] == user_id]
-        ws = await asyncio.to_thread(get_current_activity_sheet)
-        await asyncio.to_thread(reconcile_sheet_profiles, ws, users)
-    except Exception as exc:
-        await update.message.reply_text(f"Профиль сохранён, но не добавлен в таблицу: {exc}")
+    return None
+
+
+def save_activity_attendance(event, event_date, nicks, leaders):
+    """Reserve one event column for a date and write marks idempotently."""
+    year, month = attendance.moscow_month()
+    half = attendance.half_for_date(event_date)
+    event_key = attendance.event_label(event)
+    with attendance.MONTH_LOCK:
+        ws = get_activity_sheet_for_date(event_date)
+        with closing(sqlite3.connect(DB_FILE)) as conn:
+            row = conn.execute(
+                'SELECT sheet_name, column_number FROM activity_slots '
+                'WHERE year=? AND month=? AND event=? AND event_date=?',
+                (year, month, event_key, event_date)
+            ).fetchone()
+            created = False
+            if row:
+                if row[0] != ws.title:
+                    raise ValueError('Для этой даты уже сохранён другой лист активности.')
+                column = row[1]
+            else:
+                column = attendance.next_event_column(
+                    ws.get_all_values(value_render_option='FORMULA'), event_key)
+                conn.execute(
+                    'INSERT INTO activity_slots '
+                    '(year,month,half,event,event_date,sheet_name,column_number) '
+                    'VALUES (?,?,?,?,?,?,?)',
+                    (year, month, half, event_key, event_date, ws.title, column)
+                )
+                conn.commit()
+                created = True
+            try:
+                result = attendance.mark_attendance(ws, column, nicks, leaders)
+            except Exception:
+                if created:
+                    conn.execute(
+                        'DELETE FROM activity_slots WHERE year=? AND month=? AND event=? AND event_date=?',
+                        (year, month, event_key, event_date)
+                    )
+                    conn.commit()
+                raise
+            return result
 
 
 # ---------- ЭКСПОРТ РЕЗУЛЬТАТОВ ОПРОСА ----------
@@ -973,7 +1048,8 @@ async def handle_edit_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f'❌ Класс не изменён: {exc}')
         return
     update_user_class(target_user_id, new_class)
-    await update.message.reply_text(f"Класс пользователя {context.user_data['edit_class_nick']} изменён на {new_class}.")
+    await update.message.reply_text(f"Класс пользователя {context.user_data['edit_class_nick']} изменён на {new_class} в базе. "
+                                    'Проверьте класс вручную в листе «Шаблон».')
     context.user_data.pop('edit_class_mode', None)
     context.user_data.pop('edit_class_nick', None)
     context.user_data.pop('edit_class_user_id', None)
@@ -1029,7 +1105,8 @@ async def handle_edit_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute('INSERT OR IGNORE INTO nick_aliases(user_id,old_nick) VALUES (?,?)',(target_user_id,old_nick))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"Ник пользователя {context.user_data['edit_old_nick']} изменён на {new_nick}.")
+    await update.message.reply_text(f"Ник пользователя {context.user_data['edit_old_nick']} изменён на {new_nick} в базе. "
+                                    'Обновите этот ник также вручную в листе «Шаблон».')
     context.user_data.pop('edit_nick_mode', None)
     context.user_data.pop('edit_old_nick', None)
     context.user_data.pop('edit_target_user_id', None)
@@ -1185,10 +1262,7 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             if text not in attendance.EVENTS:
                 await update.message.reply_text('Выберите событие из кнопок.')
                 return
-            ws = await asyncio.to_thread(get_current_activity_sheet)
-            if state.get('activity_screenshots') and ws.title != state.get('activity_sheet'):
-                raise ValueError('Месяц сменился. Начните загрузку заново.')
-            state.update(activity_event=text, activity_step='select_date', activity_sheet=ws.title)
+            state.update(activity_event=text, activity_step='select_date')
             await show_activity_step(update, context)
         elif step == 'select_date':
             if text == '📅 Сегодня':
@@ -1196,12 +1270,10 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             elif text == '📅 Вчера':
                 text = (attendance.moscow_today() - timedelta(days=1)).strftime('%d.%m.%Y')
             text = attendance.parse_event_date(text, year, month)
-            ws = await asyncio.to_thread(get_current_activity_sheet)
-            if ws.title != state['activity_sheet']:
-                raise ValueError('Месяц сменился. Начните загрузку заново.')
+            ws = await asyncio.to_thread(get_activity_sheet_for_date, text)
             rows = await asyncio.to_thread(ws.get_all_values)
-            attendance.event_date_slot(rows, state['activity_event'], text, year, month)
             state.update(activity_date=text, activity_step='upload',
+                         activity_sheet=ws.title,
                          activity_known=[nick for _, nick in attendance.players(rows)])
             for key in ('activity_nicks', 'activity_leaders', 'activity_unknown'):
                 state.setdefault(key, [])
@@ -1220,11 +1292,11 @@ async def handle_activity_choice(update: Update, context: ContextTypes.DEFAULT_T
             if text != '✅ Записать':
                 await update.message.reply_text('Подтвердите запись кнопкой или отмените.')
                 return
-            ws = await asyncio.to_thread(get_current_activity_sheet)
+            ws = await asyncio.to_thread(get_activity_sheet_for_date, state['activity_date'])
             if ws.title != state['activity_sheet']:
                 raise ValueError('Месяц сменился. Начните заново.')
-            count, missing = await asyncio.to_thread(attendance.save_event_attendance,
-                ws, state['activity_event'], state['activity_date'], year, month,
+            count, missing = await asyncio.to_thread(save_activity_attendance,
+                state['activity_event'], state['activity_date'],
                 state['activity_nicks'], state['activity_leaders'])
             event, date = state['activity_event'], state['activity_date']
             clear_input_state(context)
@@ -1590,7 +1662,6 @@ def get_clan_management_keyboard():
     return make_keyboard([
         ['👥 Список пользователей'],
         ['🔄 Исправить ник', '✏️ Исправить класс'],
-        ['🔄 Синхронизировать игроков'],
         [ui.BACK, ui.HOME],
     ])
 

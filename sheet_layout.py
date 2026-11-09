@@ -8,7 +8,10 @@ import nickname_rules as nicknames
 
 MONTH_LOCK = RLock()
 
-EVENTS = ('РБ', 'Комендант', 'Баньши', 'ГВГ')
+EVENTS = ('РБ', 'ГТЗ', 'Рема', 'ГВГ', 'Вендиго', 'Комендант', 'Банши')
+EVENT_HEADER_ALIASES = {'БАНЬШИ': 'БАНШИ', 'БАНШИ': 'БАНШИ'}
+MONTH_NAMES = ('январь', 'февраль', 'март', 'апрель', 'май', 'июнь',
+               'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь')
 CLASS_ALIASES = {
     'ВАР': 'ВАР', 'ВАРЫ': 'ВАР', 'ВОИНЫ': 'ВАР',
     'МАГ': 'МАГ', 'МАГИ': 'МАГ', 'ДРУ': 'ДРУ', 'ДРУЛИ': 'ДРУ', 'ДРУИДЫ': 'ДРУ',
@@ -24,6 +27,10 @@ def cell(row, column):
 
 def label(value):
     return str(value).strip().upper()
+
+
+def event_label(value):
+    return EVENT_HEADER_ALIASES.get(label(value), label(value))
 
 
 def a1(column, row):
@@ -50,14 +57,16 @@ def player_class(rows, row_number):
 def layout(rows):
     for index, row in enumerate(rows[:6]):
         headers = {label(v): i for i, v in enumerate(row, 1) if str(v).strip()}
-        if 'НИК' in headers and all(label(e) in headers for e in EVENTS):
+        available_events = [event_label(event) for event in EVENTS
+                            if event_label(event) in headers]
+        if 'НИК' in headers and available_events:
             break
     else:
-        raise ValueError('Лист не соответствует «Новому шаблону»: нужны НИК, РБ, Комендант, Баньши и ГВГ.')
+        raise ValueError('Лист не содержит колонку НИК и блоки активности.')
     event_columns = {}
     stops = sorted(set(headers.values()))
-    for event in EVENTS:
-        start = headers[label(event)]
+    for event in available_events:
+        start = headers[event]
         end = next((c for c in stops if c > start), len(row) + 1)
         event_columns[event] = list(range(start, end))
     first_player = next((i for i in range(index + 1, len(rows))
@@ -105,6 +114,7 @@ def day_number(value):
 
 def event_dates(rows, event, year, month):
     spec = layout(rows)
+    event = event_label(event)
     if event not in spec['events']:
         raise ValueError('Неизвестная активность')
     result = {}
@@ -140,6 +150,7 @@ def parse_event_date(value, year, month):
 def event_date_slot(rows, event, date, year, month):
     date = parse_event_date(date, year, month)
     spec = layout(rows)
+    event = event_label(event)
     existing = event_dates(rows, event, year, month)
     if date in existing:
         return existing[date], None
@@ -170,6 +181,51 @@ def save_event_attendance(ws, event, date, year, month, nicks, leaders):
         rows = ws.get_all_values(value_render_option='FORMULA')
         column, heading = event_date_slot(rows, event, date, year, month)
         return mark_attendance(ws, column, nicks, leaders, heading)
+
+
+def activity_data_rows(rows, spec=None):
+    """Roster rows in the maintained template, excluding summary formulas."""
+    spec = spec or layout(rows)
+    start = spec['header'] + 1
+    stop = len(rows) + 1
+    for number in range(start, len(rows) + 1):
+        if class_of_row(rows[number - 1]):
+            continue
+        first = str(cell(rows[number - 1], 1)).strip()
+        second = str(cell(rows[number - 1], 2)).strip()
+        if first.startswith('=SUM(') and second.startswith('=SUM('):
+            stop = number
+            break
+    return [number for number in range(start, stop)
+            if not class_of_row(rows[number - 1])]
+
+
+def next_event_column(rows, event):
+    """Choose the next empty slot in an event block of a half-month sheet."""
+    spec = layout(rows)
+    event = event_label(event)
+    columns = spec['events'].get(event)
+    if not columns:
+        raise ValueError(f'В шаблоне нет блока активности {event}.')
+    data_rows = activity_data_rows(rows, spec)
+    for column in columns:
+        values = [str(cell(rows[number - 1], column)).strip() for number in data_rows]
+        if not any(value.startswith('=') for value in values) \
+                and all(value in ('', '0') for value in values):
+            return column
+    raise ValueError(f'В блоке {event} нет свободного столбца в этой половине месяца.')
+
+
+def half_sheet_name(year, month, half):
+    if half not in (1, 2):
+        raise ValueError('Половина месяца должна быть 1 или 2.')
+    start = 1 if half == 1 else 16
+    end = 15 if half == 1 else calendar.monthrange(year, month)[1]
+    return f'Активка {start}-{end} {MONTH_NAMES[month - 1]} ({half}/2)'
+
+
+def half_for_date(date):
+    return 1 if int(str(date).split('.')[0]) <= 15 else 2
 
 
 def mark_attendance(ws, column, nick_rows, leader, heading=None):
@@ -207,6 +263,46 @@ def mark_attendance(ws, column, nick_rows, leader, heading=None):
     if updates:
         ws.batch_update(updates, value_input_option='RAW')
     return count, missing
+
+
+def ensure_half_month(spreadsheet, year, month, half):
+    """Create a half-month copy of the human-maintained roster template."""
+    import gspread
+    name = half_sheet_name(year, month, half)
+    try:
+        ws = spreadsheet.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = None
+    if ws is not None:
+        layout(ws.get_all_values())
+        return ws
+    template = None
+    for template_name in ('Шаблон', 'Новый шаблон'):
+        try:
+            template = spreadsheet.worksheet(template_name)
+            break
+        except gspread.WorksheetNotFound:
+            continue
+    if template is None:
+        raise ValueError('В Google-таблице нет листа «Шаблон».')
+    source = template.get_all_values(value_render_option='FORMULA')
+    spec = layout(source)
+    ws = template.duplicate(insert_sheet_index=0, new_sheet_name=name)
+    data_rows = activity_data_rows(source, spec)
+    clear_columns = {column for columns in spec['events'].values() for column in columns}
+    clear_columns.update(column for key, column in spec['headers'].items()
+                         if key in ('ПЛ', 'КАПИТАНСКИЕ'))
+    ranges = [a1(column, row) for row in data_rows for column in sorted(clear_columns)
+              if not str(cell(source[row - 1], column)).startswith('=')]
+    if ranges:
+        ws.batch_clear(ranges)
+    return ws
+
+
+def ensure_month_halves(spreadsheet, year, month):
+    with MONTH_LOCK:
+        return (ensure_half_month(spreadsheet, year, month, 1),
+                ensure_half_month(spreadsheet, year, month, 2))
 
 
 def ensure_month(spreadsheet, year, month, users=None):
